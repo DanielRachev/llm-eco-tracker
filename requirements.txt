@@ -1,0 +1,3 @@
+openai
+ecologits
+python-dotenv
