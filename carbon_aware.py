@@ -17,6 +17,43 @@ logger = logging.getLogger(__name__)
 
 _session_energy_kwh = contextvars.ContextVar("session_energy_kwh", default=0.0)
 _telemetry_path = Path("eco_telemetry.jsonl")
+_ecologits_init_lock = threading.Lock()
+_ecologits_initialized = False
+_warned_missing_ecologits = False
+_warned_ecologits_init_failure = False
+
+
+def _ensure_ecologits_initialized():
+    global _ecologits_initialized
+    global _warned_missing_ecologits
+    global _warned_ecologits_init_failure
+
+    if _ecologits_initialized:
+        return True
+
+    with _ecologits_init_lock:
+        if _ecologits_initialized:
+            return True
+
+        try:
+            from ecologits import EcoLogits
+        except ImportError:
+            if not _warned_missing_ecologits:
+                logger.warning("EcoLogits not installed; energy tracking is disabled.")
+                _warned_missing_ecologits = True
+            return False
+
+        try:
+            EcoLogits.init(providers=["openai"])
+        except Exception as exc:
+            if not _warned_ecologits_init_failure:
+                logger.warning("Failed to initialize EcoLogits: %s", exc)
+                _warned_ecologits_init_failure = True
+            return False
+
+        _ecologits_initialized = True
+        logger.info("EcoLogits initialized for OpenAI telemetry.")
+        return True
 
 
 class EcoTelemetrySession:
@@ -39,6 +76,7 @@ class EcoTelemetrySession:
 
     def __enter__(self):
         self._token = _session_energy_kwh.set(0.0)
+        self._telemetry_available = _ensure_ecologits_initialized()
         self._patch_enabled = self._install_patches()
         return self
 
