@@ -1,3 +1,4 @@
 openai
 ecologits
 python-dotenv
+requests
