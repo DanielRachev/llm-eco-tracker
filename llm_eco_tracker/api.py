@@ -1,13 +1,10 @@
-import asyncio
 import functools
 import inspect
 import logging
-import threading
-from datetime import datetime, timezone
 from pathlib import Path
 
-from .emissions import summarize_emissions
-from .models import SchedulePlan, TelemetryRecord
+from .execution import ExecutionRunner
+from .models import SchedulePlan
 from .planning import (
     apply_jitter_to_plan,
     build_schedule_plan,
@@ -26,6 +23,11 @@ _telemetry_path = Path("eco_telemetry.jsonl")
 _mock_max_sleep_seconds = 1.0
 _telemetry_runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
 _telemetry_sink = JsonlTelemetrySink(_telemetry_path)
+_execution_runner = ExecutionRunner(
+    _telemetry_runtime,
+    _telemetry_sink,
+    llm_provider="openai",
+)
 
 
 def _select_forecast_provider(location: str, mock_csv: str | None) -> ForecastProvider:
@@ -77,29 +79,6 @@ def _get_schedule_plan(max_delay_hours, location, mock_csv):
     return schedule_plan
 
 
-def _log_telemetry_summary(total_kwh, schedule_plan: SchedulePlan):
-    if total_kwh <= 0:
-        logger.info("Session complete. No EcoLogits energy impacts were captured.")
-        return
-
-    emission_summary = summarize_emissions(
-        total_kwh,
-        schedule_plan.baseline_intensity_gco2eq_per_kwh,
-        schedule_plan.optimal_intensity_gco2eq_per_kwh,
-    )
-
-    logger.info("Session complete. Total energy: %.6f kWh", emission_summary.energy_kwh)
-    logger.info("Carbon delta: %.4f gCO2eq", emission_summary.saved_gco2eq)
-    _telemetry_sink.emit(
-        TelemetryRecord(
-            timestamp=datetime.now(timezone.utc),
-            emissions=emission_summary,
-            schedule_plan=schedule_plan,
-            llm_provider="openai",
-        )
-    )
-
-
 def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
     """
     Delay non-urgent work until a greener grid window, then record session-wide
@@ -148,26 +127,7 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
             async def async_wrapper(*args, **kwargs):
                 _log_intercept(func)
                 schedule_plan = _build_delay_plan()
-
-                if schedule_plan.execution_delay_seconds > 0:
-                    logger.info(
-                        "Carbon-aware scheduler: Awaiting %.2f seconds to reach a greener grid window.",
-                        schedule_plan.execution_delay_seconds,
-                    )
-                    await asyncio.sleep(schedule_plan.execution_delay_seconds)
-                else:
-                    logger.info("Carbon-aware scheduler: Executing immediately.")
-
-                logger.info("Greener window reached. Proceeding with execution.")
-
-                with _telemetry_runtime.session() as telemetry_session:
-                    try:
-                        result = await func(*args, **kwargs)
-                    finally:
-                        total_kwh = telemetry_session.energy_kwh
-
-                _log_telemetry_summary(total_kwh, schedule_plan)
-                return result
+                return await _execution_runner.run_async(func, args, kwargs, schedule_plan)
 
             return async_wrapper
 
@@ -175,47 +135,7 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
         def sync_wrapper(*args, **kwargs):
             _log_intercept(func)
             schedule_plan = _build_delay_plan()
-
-            done = threading.Event()
-            outcome = {}
-
-            def run_later():
-                try:
-                    logger.info("Greener window reached. Proceeding with execution.")
-                    with _telemetry_runtime.session() as telemetry_session:
-                        try:
-                            outcome["result"] = func(*args, **kwargs)
-                        finally:
-                            total_kwh = telemetry_session.energy_kwh
-                    _log_telemetry_summary(total_kwh, schedule_plan)
-                except BaseException as exc:
-                    outcome["exception"] = exc
-                finally:
-                    done.set()
-
-            if schedule_plan.execution_delay_seconds > 0:
-                logger.info(
-                    "Carbon-aware scheduler: Scheduling execution in %.2f seconds.",
-                    schedule_plan.execution_delay_seconds,
-                )
-                timer = threading.Timer(schedule_plan.execution_delay_seconds, run_later)
-                timer.start()
-            else:
-                logger.info("Carbon-aware scheduler: Executing immediately.")
-                timer = None
-                run_later()
-
-            try:
-                done.wait()
-            except KeyboardInterrupt:
-                if timer is not None:
-                    timer.cancel()
-                raise
-
-            if "exception" in outcome:
-                raise outcome["exception"]
-
-            return outcome.get("result")
+            return _execution_runner.run_sync(func, args, kwargs, schedule_plan)
 
         return sync_wrapper
 
