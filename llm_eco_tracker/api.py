@@ -1,6 +1,5 @@
 import asyncio
 import contextvars
-import csv
 import functools
 import inspect
 import json
@@ -10,14 +9,15 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from .emissions import summarize_emissions
-from .models import ForecastInterval, SchedulePlan
+from .models import SchedulePlan
 from .planning import (
     apply_jitter_to_plan,
     build_schedule_plan,
     cap_execution_delay,
     immediate_schedule_plan,
 )
-from .scheduler import _get_live_schedule_plan
+from .providers import CsvForecastProvider, UKCarbonIntensityProvider
+from .providers.base import ForecastProvider
 
 
 logger = logging.getLogger(__name__)
@@ -205,59 +205,10 @@ def save_telemetry(emission_summary):
         logger.warning("Failed to write telemetry file '%s': %s", _telemetry_path, exc)
 
 
-def _parse_utc_timestamp(value):
-    return datetime.strptime(value, "%Y-%m-%dT%H:%MZ").replace(tzinfo=timezone.utc)
-
-
-def _load_mock_forecast(mock_csv):
-    mock_path = Path(mock_csv)
-
-    try:
-        with mock_path.open(newline="", encoding="utf-8") as handle:
-            reader = csv.DictReader(handle)
-            rows = []
-            for row in reader:
-                rows.append(
-                    ForecastInterval(
-                        starts_at=_parse_utc_timestamp(row["from"]),
-                        ends_at=_parse_utc_timestamp(row["to"]),
-                        carbon_intensity_gco2eq_per_kwh=float(row["intensity_forecast"]),
-                    )
-                )
-    except (OSError, KeyError, ValueError) as exc:
-        logger.warning("Failed to read mock forecast data from '%s': %s", mock_csv, exc)
-        return []
-
-    return rows
-
-
-def _get_mock_schedule_plan(max_delay_hours, mock_csv):
-    forecast_intervals = _load_mock_forecast(mock_csv)
-    schedule_plan = build_schedule_plan(forecast_intervals, max_delay_hours)
-
-    if schedule_plan.baseline_interval is None or schedule_plan.selected_interval is None:
-        return schedule_plan
-
-    logger.info(
-        "Mock current forecast: %.1f gCO2eq/kWh",
-        schedule_plan.baseline_intensity_gco2eq_per_kwh,
-    )
-    logger.info(
-        "Mock best forecast found: %.1f gCO2eq/kWh at %s",
-        schedule_plan.optimal_intensity_gco2eq_per_kwh,
-        schedule_plan.selected_interval.starts_at.isoformat(),
-    )
-
-    return schedule_plan
-
-
-def _get_schedule_plan(max_delay_hours, location, mock_csv):
-    if max_delay_hours <= 0:
-        return immediate_schedule_plan()
-
+def _select_forecast_provider(location: str, mock_csv: str | None) -> ForecastProvider:
     if mock_csv:
         logger.info("Mock mode enabled: reading forecast data from '%s'.", mock_csv)
-        return _get_mock_schedule_plan(max_delay_hours, mock_csv)
+        return CsvForecastProvider(mock_csv)
 
     if location.upper() not in {"UK", "GB"}:
         logger.warning(
@@ -267,7 +218,40 @@ def _get_schedule_plan(max_delay_hours, location, mock_csv):
         )
 
     logger.info("Live mode enabled: fetching grid forecast.")
-    return _get_live_schedule_plan(max_delay_hours)
+    return UKCarbonIntensityProvider()
+
+
+def _log_schedule_plan(provider: ForecastProvider, schedule_plan: SchedulePlan):
+    if schedule_plan.baseline_interval is None or schedule_plan.selected_interval is None:
+        return
+
+    prefix = "Mock " if provider.provider_name == "csv_forecast" else ""
+    logger.info(
+        "%scurrent forecast: %.1f gCO2eq/kWh",
+        prefix,
+        schedule_plan.baseline_intensity_gco2eq_per_kwh,
+    )
+    logger.info(
+        "%sbest forecast found: %.1f gCO2eq/kWh at %s",
+        prefix,
+        schedule_plan.optimal_intensity_gco2eq_per_kwh,
+        schedule_plan.selected_interval.starts_at.isoformat(),
+    )
+
+
+def _get_schedule_plan(max_delay_hours, location, mock_csv):
+    if max_delay_hours <= 0:
+        return immediate_schedule_plan()
+
+    forecast_provider = _select_forecast_provider(location, mock_csv)
+    forecast_snapshot = forecast_provider.load_forecast(max_delay_hours)
+    schedule_plan = build_schedule_plan(
+        forecast_snapshot.intervals,
+        max_delay_hours,
+        reference_time=forecast_snapshot.reference_time,
+    )
+    _log_schedule_plan(forecast_provider, schedule_plan)
+    return schedule_plan
 
 
 def _get_session_energy():

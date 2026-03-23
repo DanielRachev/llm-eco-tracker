@@ -14,6 +14,14 @@ class ForecastInterval:
 
 
 @dataclass(frozen=True, slots=True)
+class ForecastSnapshot:
+    """A provider response containing forecast intervals and their reference time."""
+
+    intervals: tuple[ForecastInterval, ...]
+    reference_time: datetime | None = None
+
+
+@dataclass(frozen=True, slots=True)
 class SchedulePlan:
     """The selected execution plan for a carbon-aware invocation."""
 
