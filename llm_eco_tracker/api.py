@@ -5,11 +5,18 @@ import functools
 import inspect
 import json
 import logging
-import random
 import threading
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 from pathlib import Path
 
+from .emissions import summarize_emissions
+from .models import ForecastInterval, SchedulePlan
+from .planning import (
+    apply_jitter_to_plan,
+    build_schedule_plan,
+    cap_execution_delay,
+    immediate_schedule_plan,
+)
 from .scheduler import _get_live_schedule_plan
 
 
@@ -179,30 +186,16 @@ class EcoTelemetrySession:
             logger.debug("Skipping non-numeric energy value: %r", energy)
 
 
-def apply_jitter(delay_seconds):
-    """
-    Randomly spreads delayed executions to avoid many jobs resuming at the
-    exact same timestamp.
-    """
-    if delay_seconds <= 0:
-        return 0.0
-
-    jitter_window = delay_seconds * 0.10
-    jitter = random.uniform(-jitter_window, jitter_window)
-    return max(0.0, delay_seconds + jitter)
-
-
-def save_telemetry(baseline_emissions, actual_emissions):
+def save_telemetry(emission_summary):
     """
     Persists telemetry as newline-delimited JSON so each invocation appends a
     single record without rewriting the full file.
     """
-    savings = baseline_emissions - actual_emissions
     record = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
-        "baseline_gco2eq": baseline_emissions,
-        "actual_gco2eq": actual_emissions,
-        "saved_gco2eq": savings,
+        "baseline_gco2eq": emission_summary.baseline_gco2eq,
+        "actual_gco2eq": emission_summary.actual_gco2eq,
+        "saved_gco2eq": emission_summary.saved_gco2eq,
     }
 
     try:
@@ -225,11 +218,11 @@ def _load_mock_forecast(mock_csv):
             rows = []
             for row in reader:
                 rows.append(
-                    {
-                        "from": _parse_utc_timestamp(row["from"]),
-                        "to": _parse_utc_timestamp(row["to"]),
-                        "forecast": float(row["intensity_forecast"]),
-                    }
+                    ForecastInterval(
+                        starts_at=_parse_utc_timestamp(row["from"]),
+                        ends_at=_parse_utc_timestamp(row["to"]),
+                        carbon_intensity_gco2eq_per_kwh=float(row["intensity_forecast"]),
+                    )
                 )
     except (OSError, KeyError, ValueError) as exc:
         logger.warning("Failed to read mock forecast data from '%s': %s", mock_csv, exc)
@@ -239,35 +232,28 @@ def _load_mock_forecast(mock_csv):
 
 
 def _get_mock_schedule_plan(max_delay_hours, mock_csv):
-    rows = _load_mock_forecast(mock_csv)
-    if not rows:
-        return 0.0, 0.0, 0.0
+    forecast_intervals = _load_mock_forecast(mock_csv)
+    schedule_plan = build_schedule_plan(forecast_intervals, max_delay_hours)
 
-    current_block = rows[0]
-    baseline_intensity = current_block["forecast"]
-    search_deadline = current_block["from"] + timedelta(hours=max_delay_hours)
+    if schedule_plan.baseline_interval is None or schedule_plan.selected_interval is None:
+        return schedule_plan
 
-    candidate_rows = [
-        row for row in rows if row["from"] <= search_deadline
-    ] or [current_block]
-
-    best_block = min(candidate_rows, key=lambda row: row["forecast"])
-    delay_seconds = max(0.0, (best_block["from"] - current_block["from"]).total_seconds())
-    optimal_intensity = best_block["forecast"]
-
-    logger.info("Mock current forecast: %.1f gCO2eq/kWh", baseline_intensity)
+    logger.info(
+        "Mock current forecast: %.1f gCO2eq/kWh",
+        schedule_plan.baseline_intensity_gco2eq_per_kwh,
+    )
     logger.info(
         "Mock best forecast found: %.1f gCO2eq/kWh at %s",
-        optimal_intensity,
-        best_block["from"].isoformat(),
+        schedule_plan.optimal_intensity_gco2eq_per_kwh,
+        schedule_plan.selected_interval.starts_at.isoformat(),
     )
 
-    return baseline_intensity, delay_seconds, optimal_intensity
+    return schedule_plan
 
 
 def _get_schedule_plan(max_delay_hours, location, mock_csv):
     if max_delay_hours <= 0:
-        return 0.0, 0.0, 0.0
+        return immediate_schedule_plan()
 
     if mock_csv:
         logger.info("Mock mode enabled: reading forecast data from '%s'.", mock_csv)
@@ -288,18 +274,20 @@ def _get_session_energy():
     return float(_session_energy_kwh.get())
 
 
-def _log_telemetry_summary(total_kwh, baseline_intensity, optimal_intensity):
+def _log_telemetry_summary(total_kwh, schedule_plan: SchedulePlan):
     if total_kwh <= 0:
         logger.info("Session complete. No EcoLogits energy impacts were captured.")
         return
 
-    baseline_gco2eq = total_kwh * baseline_intensity
-    actual_gco2eq = total_kwh * optimal_intensity
-    saved_gco2eq = baseline_gco2eq - actual_gco2eq
+    emission_summary = summarize_emissions(
+        total_kwh,
+        schedule_plan.baseline_intensity_gco2eq_per_kwh,
+        schedule_plan.optimal_intensity_gco2eq_per_kwh,
+    )
 
-    logger.info("Session complete. Total energy: %.6f kWh", total_kwh)
-    logger.info("Carbon delta: %.4f gCO2eq", saved_gco2eq)
-    save_telemetry(baseline_gco2eq, actual_gco2eq)
+    logger.info("Session complete. Total energy: %.6f kWh", emission_summary.energy_kwh)
+    logger.info("Carbon delta: %.4f gCO2eq", emission_summary.saved_gco2eq)
+    save_telemetry(emission_summary)
 
 
 def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
@@ -320,30 +308,28 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
             logger.info("Using mock forecast data from: %s", mock_csv)
 
     def _build_delay_plan():
-        baseline_intensity, raw_delay, optimal_intensity = _get_schedule_plan(
-            max_delay_hours, location, mock_csv
-        )
-        jittered_delay = apply_jitter(raw_delay)
-        final_delay = jittered_delay
+        schedule_plan = _get_schedule_plan(max_delay_hours, location, mock_csv)
+        jittered_plan = apply_jitter_to_plan(schedule_plan)
+        final_plan = jittered_plan
 
-        if mock_csv and final_delay > _mock_max_sleep_seconds:
+        if mock_csv and final_plan.execution_delay_seconds > _mock_max_sleep_seconds:
             logger.info(
                 "Mock mode: capping actual wait from %.2fs to %.2fs.",
-                final_delay,
+                final_plan.execution_delay_seconds,
                 _mock_max_sleep_seconds,
             )
-            final_delay = _mock_max_sleep_seconds
+            final_plan = cap_execution_delay(final_plan, _mock_max_sleep_seconds)
 
         logger.info(
             "Scheduling plan: baseline %.1f gCO2eq/kWh, optimal %.1f gCO2eq/kWh, raw delay %.2fs, jittered delay %.2fs, execution delay %.2fs",
-            baseline_intensity,
-            optimal_intensity,
-            raw_delay,
-            jittered_delay,
-            final_delay,
+            final_plan.baseline_intensity_gco2eq_per_kwh,
+            final_plan.optimal_intensity_gco2eq_per_kwh,
+            final_plan.raw_delay_seconds,
+            jittered_plan.execution_delay_seconds,
+            final_plan.execution_delay_seconds,
         )
 
-        return baseline_intensity, optimal_intensity, final_delay
+        return final_plan
 
     def decorator(func):
         if inspect.iscoroutinefunction(func):
@@ -351,14 +337,14 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
                 _log_intercept(func)
-                baseline_intensity, optimal_intensity, final_delay = _build_delay_plan()
+                schedule_plan = _build_delay_plan()
 
-                if final_delay > 0:
+                if schedule_plan.execution_delay_seconds > 0:
                     logger.info(
                         "Carbon-aware scheduler: Awaiting %.2f seconds to reach a greener grid window.",
-                        final_delay,
+                        schedule_plan.execution_delay_seconds,
                     )
-                    await asyncio.sleep(final_delay)
+                    await asyncio.sleep(schedule_plan.execution_delay_seconds)
                 else:
                     logger.info("Carbon-aware scheduler: Executing immediately.")
 
@@ -370,7 +356,7 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
                     finally:
                         total_kwh = _get_session_energy()
 
-                _log_telemetry_summary(total_kwh, baseline_intensity, optimal_intensity)
+                _log_telemetry_summary(total_kwh, schedule_plan)
                 return result
 
             return async_wrapper
@@ -378,7 +364,7 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
         @functools.wraps(func)
         def sync_wrapper(*args, **kwargs):
             _log_intercept(func)
-            baseline_intensity, optimal_intensity, final_delay = _build_delay_plan()
+            schedule_plan = _build_delay_plan()
 
             done = threading.Event()
             outcome = {}
@@ -391,18 +377,18 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
                             outcome["result"] = func(*args, **kwargs)
                         finally:
                             total_kwh = _get_session_energy()
-                    _log_telemetry_summary(total_kwh, baseline_intensity, optimal_intensity)
+                    _log_telemetry_summary(total_kwh, schedule_plan)
                 except BaseException as exc:
                     outcome["exception"] = exc
                 finally:
                     done.set()
 
-            if final_delay > 0:
+            if schedule_plan.execution_delay_seconds > 0:
                 logger.info(
                     "Carbon-aware scheduler: Scheduling execution in %.2f seconds.",
-                    final_delay,
+                    schedule_plan.execution_delay_seconds,
                 )
-                timer = threading.Timer(final_delay, run_later)
+                timer = threading.Timer(schedule_plan.execution_delay_seconds, run_later)
                 timer.start()
             else:
                 logger.info("Carbon-aware scheduler: Executing immediately.")
