@@ -1,5 +1,4 @@
 import asyncio
-import contextvars
 import functools
 import inspect
 import json
@@ -18,172 +17,15 @@ from .planning import (
 )
 from .providers import CsvForecastProvider, UKCarbonIntensityProvider
 from .providers.base import ForecastProvider
+from .telemetry import EcoLogitsRuntime
+from .telemetry.adapters import OpenAIChatCompletionsAdapter
 
 
 logger = logging.getLogger(__name__)
 
-_session_energy_kwh = contextvars.ContextVar("session_energy_kwh", default=0.0)
 _telemetry_path = Path("eco_telemetry.jsonl")
-_ecologits_init_lock = threading.Lock()
-_ecologits_initialized = False
-_warned_missing_ecologits = False
-_warned_ecologits_init_failure = False
 _mock_max_sleep_seconds = 1.0
-
-
-def _ensure_ecologits_initialized():
-    global _ecologits_initialized
-    global _warned_missing_ecologits
-    global _warned_ecologits_init_failure
-
-    if _ecologits_initialized:
-        return True
-
-    with _ecologits_init_lock:
-        if _ecologits_initialized:
-            return True
-
-        try:
-            from ecologits import EcoLogits
-        except ImportError:
-            if not _warned_missing_ecologits:
-                logger.warning("EcoLogits not installed; energy tracking is disabled.")
-                _warned_missing_ecologits = True
-            return False
-
-        try:
-            EcoLogits.init(providers=["openai"])
-        except Exception as exc:
-            if not _warned_ecologits_init_failure:
-                logger.warning("Failed to initialize EcoLogits: %s", exc)
-                _warned_ecologits_init_failure = True
-            return False
-
-        _ecologits_initialized = True
-        logger.info("EcoLogits initialized for OpenAI telemetry.")
-        return True
-
-
-class EcoTelemetrySession:
-    """
-    Tracks EcoLogits energy impacts across all OpenAI chat completion calls
-    made inside a decorated function.
-
-    The OpenAI method patch is process-wide, so a lock and reference count are
-    used to avoid restoring the original methods while another decorated
-    session is still running.
-    """
-
-    _patch_lock = threading.RLock()
-    _active_sessions = 0
-    _original_sync_create = None
-    _original_async_create = None
-    _sync_completions_cls = None
-    _async_completions_cls = None
-    _warned_missing_openai = False
-
-    def __enter__(self):
-        self._token = _session_energy_kwh.set(0.0)
-        self._telemetry_available = _ensure_ecologits_initialized()
-        self._patch_enabled = self._install_patches()
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        if self._patch_enabled:
-            self._remove_patches()
-        _session_energy_kwh.reset(self._token)
-
-    @classmethod
-    def _install_patches(cls):
-        with cls._patch_lock:
-            if cls._active_sessions == 0:
-                if not cls._patch_openai_methods():
-                    return False
-            cls._active_sessions += 1
-            return True
-
-    @classmethod
-    def _remove_patches(cls):
-        with cls._patch_lock:
-            cls._active_sessions -= 1
-            if cls._active_sessions > 0:
-                return
-
-            if cls._sync_completions_cls and cls._original_sync_create:
-                cls._sync_completions_cls.create = cls._original_sync_create
-            if cls._async_completions_cls and cls._original_async_create:
-                cls._async_completions_cls.create = cls._original_async_create
-
-            cls._original_sync_create = None
-            cls._original_async_create = None
-            cls._sync_completions_cls = None
-            cls._async_completions_cls = None
-
-    @classmethod
-    def _patch_openai_methods(cls):
-        completions_cls, async_completions_cls = cls._import_openai_classes()
-        if completions_cls is None:
-            return False
-
-        cls._sync_completions_cls = completions_cls
-        cls._async_completions_cls = async_completions_cls
-        cls._original_sync_create = completions_cls.create
-        completions_cls.create = cls._build_sync_tracker()
-
-        if async_completions_cls is not None:
-            cls._original_async_create = async_completions_cls.create
-            async_completions_cls.create = cls._build_async_tracker()
-
-        return True
-
-    @classmethod
-    def _import_openai_classes(cls):
-        try:
-            from openai.resources.chat.completions import Completions
-        except ImportError:
-            if not cls._warned_missing_openai:
-                logger.warning("OpenAI SDK not installed; session telemetry is disabled.")
-                cls._warned_missing_openai = True
-            return None, None
-
-        try:
-            from openai.resources.chat.completions import AsyncCompletions
-        except ImportError:
-            AsyncCompletions = None
-
-        return Completions, AsyncCompletions
-
-    @classmethod
-    def _build_sync_tracker(cls):
-        @functools.wraps(cls._original_sync_create)
-        def tracking_create(*args, **kwargs):
-            response = cls._original_sync_create(*args, **kwargs)
-            cls._record_energy(response)
-            return response
-
-        return tracking_create
-
-    @classmethod
-    def _build_async_tracker(cls):
-        @functools.wraps(cls._original_async_create)
-        async def tracking_create(*args, **kwargs):
-            response = await cls._original_async_create(*args, **kwargs)
-            cls._record_energy(response)
-            return response
-
-        return tracking_create
-
-    @classmethod
-    def _record_energy(cls, response):
-        impacts = getattr(response, "impacts", None)
-        energy = getattr(getattr(impacts, "energy", None), "value", None)
-        if energy is None:
-            return
-
-        try:
-            _session_energy_kwh.set(_session_energy_kwh.get() + float(energy))
-        except (TypeError, ValueError):
-            logger.debug("Skipping non-numeric energy value: %r", energy)
+_telemetry_runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
 
 
 def save_telemetry(emission_summary):
@@ -252,10 +94,6 @@ def _get_schedule_plan(max_delay_hours, location, mock_csv):
     )
     _log_schedule_plan(forecast_provider, schedule_plan)
     return schedule_plan
-
-
-def _get_session_energy():
-    return float(_session_energy_kwh.get())
 
 
 def _log_telemetry_summary(total_kwh, schedule_plan: SchedulePlan):
@@ -334,11 +172,11 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
 
                 logger.info("Greener window reached. Proceeding with execution.")
 
-                with EcoTelemetrySession():
+                with _telemetry_runtime.session() as telemetry_session:
                     try:
                         result = await func(*args, **kwargs)
                     finally:
-                        total_kwh = _get_session_energy()
+                        total_kwh = telemetry_session.energy_kwh
 
                 _log_telemetry_summary(total_kwh, schedule_plan)
                 return result
@@ -356,11 +194,11 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
             def run_later():
                 try:
                     logger.info("Greener window reached. Proceeding with execution.")
-                    with EcoTelemetrySession():
+                    with _telemetry_runtime.session() as telemetry_session:
                         try:
                             outcome["result"] = func(*args, **kwargs)
                         finally:
-                            total_kwh = _get_session_energy()
+                            total_kwh = telemetry_session.energy_kwh
                     _log_telemetry_summary(total_kwh, schedule_plan)
                 except BaseException as exc:
                     outcome["exception"] = exc
