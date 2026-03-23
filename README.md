@@ -23,7 +23,7 @@ Wrap your LLM calls with the `@carbon_aware` decorator to enable sustainable sch
 The decorator supports both synchronous and asynchronous functions.
 
 ```python
-from carbon_aware import carbon_aware
+from llm_eco_tracker import carbon_aware
 
 @carbon_aware(max_delay_hours=2, location="NL", mock_csv=None)
 def call_llm(prompt):
@@ -32,7 +32,7 @@ def call_llm(prompt):
 ```
 
 ```python
-from carbon_aware import carbon_aware
+from llm_eco_tracker import carbon_aware
 
 @carbon_aware(max_delay_hours=2, location="NL")
 async def call_llm_async(prompt):

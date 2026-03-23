@@ -10,7 +10,7 @@ import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from scheduler import _get_live_schedule_plan
+from .scheduler import _get_live_schedule_plan
 
 
 logger = logging.getLogger(__name__)
