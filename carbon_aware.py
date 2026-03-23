@@ -21,6 +21,7 @@ _ecologits_init_lock = threading.Lock()
 _ecologits_initialized = False
 _warned_missing_ecologits = False
 _warned_ecologits_init_failure = False
+_mock_max_sleep_seconds = 1.0
 
 
 def _ensure_ecologits_initialized():
@@ -322,13 +323,23 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
         baseline_intensity, raw_delay, optimal_intensity = _get_schedule_plan(
             max_delay_hours, location, mock_csv
         )
-        final_delay = apply_jitter(raw_delay)
+        jittered_delay = apply_jitter(raw_delay)
+        final_delay = jittered_delay
+
+        if mock_csv and final_delay > _mock_max_sleep_seconds:
+            logger.info(
+                "Mock mode: capping actual wait from %.2fs to %.2fs.",
+                final_delay,
+                _mock_max_sleep_seconds,
+            )
+            final_delay = _mock_max_sleep_seconds
 
         logger.info(
-            "Scheduling plan: baseline %.1f gCO2eq/kWh, optimal %.1f gCO2eq/kWh, raw delay %.2fs, jittered delay %.2fs",
+            "Scheduling plan: baseline %.1f gCO2eq/kWh, optimal %.1f gCO2eq/kWh, raw delay %.2fs, jittered delay %.2fs, execution delay %.2fs",
             baseline_intensity,
             optimal_intensity,
             raw_delay,
+            jittered_delay,
             final_delay,
         )
 
