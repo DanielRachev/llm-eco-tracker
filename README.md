@@ -20,6 +20,7 @@ pip install -r requirements.txt
 ### Carbon-Aware Decorator
 
 Wrap your LLM calls with the `@carbon_aware` decorator to enable sustainable scheduling.
+The decorator supports both synchronous and asynchronous functions.
 
 ```python
 from carbon_aware import carbon_aware
@@ -27,6 +28,15 @@ from carbon_aware import carbon_aware
 @carbon_aware(max_delay_hours=2, location="NL", mock_csv=None)
 def call_llm(prompt):
     # Your LLM logic here
+    pass
+```
+
+```python
+from carbon_aware import carbon_aware
+
+@carbon_aware(max_delay_hours=2, location="NL")
+async def call_llm_async(prompt):
+    # Your async LLM logic here
     pass
 ```
 
