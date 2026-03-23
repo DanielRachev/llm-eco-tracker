@@ -46,7 +46,7 @@ from llm_eco_tracker.providers import CsvForecastProvider
 
 @carbon_aware(
     max_delay_hours=2,
-    forecast_provider=CsvForecastProvider("mock_data.csv"),
+    forecast_provider=CsvForecastProvider("tests/fixtures/mock_forecast.csv"),
 )
 def call_llm_with_csv_forecast(prompt):
     # Your LLM logic here
