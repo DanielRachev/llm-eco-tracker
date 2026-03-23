@@ -1,14 +1,13 @@
 import asyncio
 import functools
 import inspect
-import json
 import logging
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .emissions import summarize_emissions
-from .models import SchedulePlan
+from .models import SchedulePlan, TelemetryRecord
 from .planning import (
     apply_jitter_to_plan,
     build_schedule_plan,
@@ -17,7 +16,7 @@ from .planning import (
 )
 from .providers import CsvForecastProvider, UKCarbonIntensityProvider
 from .providers.base import ForecastProvider
-from .telemetry import EcoLogitsRuntime
+from .telemetry import EcoLogitsRuntime, JsonlTelemetrySink
 from .telemetry.adapters import OpenAIChatCompletionsAdapter
 
 
@@ -26,25 +25,7 @@ logger = logging.getLogger(__name__)
 _telemetry_path = Path("eco_telemetry.jsonl")
 _mock_max_sleep_seconds = 1.0
 _telemetry_runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
-
-
-def save_telemetry(emission_summary):
-    """
-    Persists telemetry as newline-delimited JSON so each invocation appends a
-    single record without rewriting the full file.
-    """
-    record = {
-        "timestamp": datetime.now(timezone.utc).isoformat(),
-        "baseline_gco2eq": emission_summary.baseline_gco2eq,
-        "actual_gco2eq": emission_summary.actual_gco2eq,
-        "saved_gco2eq": emission_summary.saved_gco2eq,
-    }
-
-    try:
-        with _telemetry_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(record) + "\n")
-    except OSError as exc:
-        logger.warning("Failed to write telemetry file '%s': %s", _telemetry_path, exc)
+_telemetry_sink = JsonlTelemetrySink(_telemetry_path)
 
 
 def _select_forecast_provider(location: str, mock_csv: str | None) -> ForecastProvider:
@@ -109,7 +90,14 @@ def _log_telemetry_summary(total_kwh, schedule_plan: SchedulePlan):
 
     logger.info("Session complete. Total energy: %.6f kWh", emission_summary.energy_kwh)
     logger.info("Carbon delta: %.4f gCO2eq", emission_summary.saved_gco2eq)
-    save_telemetry(emission_summary)
+    _telemetry_sink.emit(
+        TelemetryRecord(
+            timestamp=datetime.now(timezone.utc),
+            emissions=emission_summary,
+            schedule_plan=schedule_plan,
+            llm_provider="openai",
+        )
+    )
 
 
 def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
