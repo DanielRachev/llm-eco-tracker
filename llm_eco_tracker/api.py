@@ -8,67 +8,54 @@ from .models import SchedulePlan
 from .planning import (
     apply_jitter_to_plan,
     build_schedule_plan,
-    cap_execution_delay,
     immediate_schedule_plan,
 )
-from .providers import CsvForecastProvider, UKCarbonIntensityProvider
+from .providers import UKCarbonIntensityProvider
 from .providers.base import ForecastProvider
 from .telemetry import EcoLogitsRuntime, JsonlTelemetrySink
 from .telemetry.adapters import OpenAIChatCompletionsAdapter
+from .telemetry.base import TelemetrySink
 
 
 logger = logging.getLogger(__name__)
 
 _telemetry_path = Path("eco_telemetry.jsonl")
-_mock_max_sleep_seconds = 1.0
-_telemetry_runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
-_telemetry_sink = JsonlTelemetrySink(_telemetry_path)
-_execution_runner = ExecutionRunner(
-    _telemetry_runtime,
-    _telemetry_sink,
-    llm_provider="openai",
-)
+_default_telemetry_runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
+_default_telemetry_sink = JsonlTelemetrySink(_telemetry_path)
 
 
-def _select_forecast_provider(location: str, mock_csv: str | None) -> ForecastProvider:
-    if mock_csv:
-        logger.info("Mock mode enabled: reading forecast data from '%s'.", mock_csv)
-        return CsvForecastProvider(mock_csv)
+def _resolve_forecast_provider(forecast_provider: ForecastProvider | None) -> ForecastProvider:
+    if forecast_provider is None:
+        return UKCarbonIntensityProvider()
 
-    if location.upper() not in {"UK", "GB"}:
-        logger.warning(
-            "Live scheduling currently uses the UK Carbon Intensity API. "
-            "Location '%s' is not applied yet.",
-            location,
-        )
-
-    logger.info("Live mode enabled: fetching grid forecast.")
-    return UKCarbonIntensityProvider()
+    return forecast_provider
 
 
-def _log_schedule_plan(provider: ForecastProvider, schedule_plan: SchedulePlan):
+def _resolve_telemetry_sink(telemetry_sink: TelemetrySink | None) -> TelemetrySink:
+    return telemetry_sink or _default_telemetry_sink
+
+
+def _log_schedule_plan(forecast_provider: ForecastProvider, schedule_plan: SchedulePlan):
     if schedule_plan.baseline_interval is None or schedule_plan.selected_interval is None:
         return
 
-    prefix = "Mock " if provider.provider_name == "csv_forecast" else ""
     logger.info(
-        "%scurrent forecast: %.1f gCO2eq/kWh",
-        prefix,
+        "Current forecast from '%s': %.1f gCO2eq/kWh",
+        forecast_provider.provider_name,
         schedule_plan.baseline_intensity_gco2eq_per_kwh,
     )
     logger.info(
-        "%sbest forecast found: %.1f gCO2eq/kWh at %s",
-        prefix,
+        "Best forecast from '%s': %.1f gCO2eq/kWh at %s",
+        forecast_provider.provider_name,
         schedule_plan.optimal_intensity_gco2eq_per_kwh,
         schedule_plan.selected_interval.starts_at.isoformat(),
     )
 
 
-def _get_schedule_plan(max_delay_hours, location, mock_csv):
+def _get_schedule_plan(max_delay_hours: float, forecast_provider: ForecastProvider) -> SchedulePlan:
     if max_delay_hours <= 0:
         return immediate_schedule_plan()
 
-    forecast_provider = _select_forecast_provider(location, mock_csv)
     forecast_snapshot = forecast_provider.load_forecast(max_delay_hours)
     schedule_plan = build_schedule_plan(
         forecast_snapshot.intervals,
@@ -79,42 +66,47 @@ def _get_schedule_plan(max_delay_hours, location, mock_csv):
     return schedule_plan
 
 
-def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
+def carbon_aware(
+    *,
+    max_delay_hours: int = 2,
+    forecast_provider: ForecastProvider | None = None,
+    telemetry_sink: TelemetrySink | None = None,
+):
     """
     Delay non-urgent work until a greener grid window, then record session-wide
     energy telemetry for OpenAI chat completions executed inside the function.
 
     Args:
         max_delay_hours (int): Maximum time to wait for a greener grid window.
-        location (str): Region hint for future scheduler backends.
-        mock_csv (str | None): Optional CSV path for deterministic mock forecasts.
+        forecast_provider (ForecastProvider | None): Source of carbon-intensity forecasts.
+        telemetry_sink (TelemetrySink | None): Destination for normalized telemetry records.
     """
+
+    resolved_forecast_provider = _resolve_forecast_provider(forecast_provider)
+    resolved_telemetry_sink = _resolve_telemetry_sink(telemetry_sink)
+    execution_runner = ExecutionRunner(
+        _default_telemetry_runtime,
+        resolved_telemetry_sink,
+        llm_provider="openai",
+    )
 
     def _log_intercept(func):
         logger.info("Intercepting call to '%s'", func.__name__)
-        logger.info("Target location: %s, max delay: %sh", location, max_delay_hours)
-        if mock_csv:
-            logger.info("Using mock forecast data from: %s", mock_csv)
+        logger.info(
+            "Forecast provider: %s, max delay: %sh",
+            resolved_forecast_provider.provider_name,
+            max_delay_hours,
+        )
 
     def _build_delay_plan():
-        schedule_plan = _get_schedule_plan(max_delay_hours, location, mock_csv)
-        jittered_plan = apply_jitter_to_plan(schedule_plan)
-        final_plan = jittered_plan
-
-        if mock_csv and final_plan.execution_delay_seconds > _mock_max_sleep_seconds:
-            logger.info(
-                "Mock mode: capping actual wait from %.2fs to %.2fs.",
-                final_plan.execution_delay_seconds,
-                _mock_max_sleep_seconds,
-            )
-            final_plan = cap_execution_delay(final_plan, _mock_max_sleep_seconds)
+        schedule_plan = _get_schedule_plan(max_delay_hours, resolved_forecast_provider)
+        final_plan = apply_jitter_to_plan(schedule_plan)
 
         logger.info(
-            "Scheduling plan: baseline %.1f gCO2eq/kWh, optimal %.1f gCO2eq/kWh, raw delay %.2fs, jittered delay %.2fs, execution delay %.2fs",
+            "Scheduling plan: baseline %.1f gCO2eq/kWh, optimal %.1f gCO2eq/kWh, raw delay %.2fs, execution delay %.2fs",
             final_plan.baseline_intensity_gco2eq_per_kwh,
             final_plan.optimal_intensity_gco2eq_per_kwh,
             final_plan.raw_delay_seconds,
-            jittered_plan.execution_delay_seconds,
             final_plan.execution_delay_seconds,
         )
 
@@ -127,7 +119,13 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
             async def async_wrapper(*args, **kwargs):
                 _log_intercept(func)
                 schedule_plan = _build_delay_plan()
-                return await _execution_runner.run_async(func, args, kwargs, schedule_plan)
+                return await execution_runner.run_async(
+                    func,
+                    args,
+                    kwargs,
+                    schedule_plan,
+                    forecast_provider=resolved_forecast_provider.provider_name,
+                )
 
             return async_wrapper
 
@@ -135,7 +133,13 @@ def carbon_aware(max_delay_hours=2, location="NL", mock_csv=None):
         def sync_wrapper(*args, **kwargs):
             _log_intercept(func)
             schedule_plan = _build_delay_plan()
-            return _execution_runner.run_sync(func, args, kwargs, schedule_plan)
+            return execution_runner.run_sync(
+                func,
+                args,
+                kwargs,
+                schedule_plan,
+                forecast_provider=resolved_forecast_provider.provider_name,
+            )
 
         return sync_wrapper
 

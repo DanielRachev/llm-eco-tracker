@@ -25,7 +25,7 @@ The decorator supports both synchronous and asynchronous functions.
 ```python
 from llm_eco_tracker import carbon_aware
 
-@carbon_aware(max_delay_hours=2, location="NL", mock_csv=None)
+@carbon_aware(max_delay_hours=2)
 def call_llm(prompt):
     # Your LLM logic here
     pass
@@ -34,9 +34,22 @@ def call_llm(prompt):
 ```python
 from llm_eco_tracker import carbon_aware
 
-@carbon_aware(max_delay_hours=2, location="NL")
+@carbon_aware(max_delay_hours=2)
 async def call_llm_async(prompt):
     # Your async LLM logic here
+    pass
+```
+
+```python
+from llm_eco_tracker import carbon_aware
+from llm_eco_tracker.providers import CsvForecastProvider
+
+@carbon_aware(
+    max_delay_hours=2,
+    forecast_provider=CsvForecastProvider("mock_data.csv"),
+)
+def call_llm_with_csv_forecast(prompt):
+    # Your LLM logic here
     pass
 ```
 
