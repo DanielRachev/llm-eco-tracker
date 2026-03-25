@@ -30,6 +30,9 @@ carbon_aware(
     max_delay_hours=2,
     forecast_provider=None,
     telemetry_sink=None,
+    auto_downgrade=False,
+    dirty_threshold=300.0,
+    model_fallbacks=None,
 )
 ```
 
@@ -58,9 +61,31 @@ from llm_eco_tracker.providers import CsvForecastProvider
 @carbon_aware(
     max_delay_hours=2,
     forecast_provider=CsvForecastProvider("tests/fixtures/mock_forecast.csv"),
+    auto_downgrade=True,
 )
 def call_llm_with_csv_forecast(prompt):
     # Your LLM logic here
+    pass
+```
+
+`auto_downgrade=True` enables an execution-time fallback when the chosen grid window is
+still above `dirty_threshold`. The current OpenAI defaults are:
+
+- `gpt-4o -> gpt-4o-mini`
+- `gpt-4.1 -> gpt-4.1-mini`
+- `gpt-4-turbo -> gpt-4o-mini`
+- `gpt-4 -> gpt-4o-mini`
+
+You can override or extend that map per decorator call:
+
+```python
+@carbon_aware(
+    max_delay_hours=2,
+    auto_downgrade=True,
+    dirty_threshold=300.0,
+    model_fallbacks={"custom-large-model": "custom-small-model"},
+)
+def call_llm_with_fallbacks(prompt):
     pass
 ```
 
@@ -75,6 +100,9 @@ The library currently supports these telemetry sink shapes:
 - `LoggerTelemetrySink`: emits `Telemetry record: {...}` through Python logging.
 - `NoOpTelemetrySink`: discards telemetry records.
 - `CompositeTelemetrySink`: fans out one telemetry record to multiple sinks.
+
+Telemetry records include per-session `model_usage` summaries so you can see which
+requested models were kept versus downgraded.
 
 ### Telemetry Report CLI
 

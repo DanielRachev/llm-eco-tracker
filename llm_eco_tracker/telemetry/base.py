@@ -1,15 +1,28 @@
 from __future__ import annotations
 
-from collections.abc import Callable
 from typing import Protocol
 
-from ..models import TelemetryRecord
+from ..models import ModelDowngradePolicy, TelemetryRecord
+
+
+class TelemetrySessionHooks(Protocol):
+    def get_model_downgrade_policy(self) -> ModelDowngradePolicy:
+        """Return the active per-session model downgrade policy."""
+
+    def record_energy_kwh(self, energy_kwh: float) -> None:
+        """Add energy captured for the current session."""
+
+    def record_model_usage(self, requested_model: str | None, effective_model: str | None) -> None:
+        """Record one model invocation for the current session."""
+
+    def should_warn_unmapped_model(self, requested_model: str) -> bool:
+        """Return whether an unmapped-model warning should be emitted now."""
 
 
 class TelemetryAdapter(Protocol):
     provider_name: str
 
-    def install(self, record_energy_kwh: Callable[[float], None]) -> bool:
+    def install(self, session_hooks: TelemetrySessionHooks) -> bool:
         """Install provider-specific telemetry hooks for the current process."""
 
     def uninstall(self) -> None:

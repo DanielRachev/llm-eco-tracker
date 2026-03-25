@@ -7,7 +7,7 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .emissions import summarize_emissions
-from .models import SchedulePlan, TelemetryRecord
+from .models import ModelDowngradePolicy, ModelUsageSummary, SchedulePlan, TelemetryRecord
 from .telemetry.base import TelemetrySink
 from .telemetry.runtime import EcoLogitsRuntime
 
@@ -35,6 +35,7 @@ class ExecutionRunner:
         *,
         forecast_provider: str | None = None,
         model: str | None = None,
+        model_downgrade_policy: ModelDowngradePolicy | None = None,
         metadata: dict[str, str] | None = None,
     ):
         self._log_async_delay(schedule_plan)
@@ -44,17 +45,21 @@ class ExecutionRunner:
 
         logger.info("Greener window reached. Proceeding with execution.")
 
-        with self._telemetry_runtime.session() as telemetry_session:
+        with self._telemetry_runtime.session(
+            model_downgrade_policy=model_downgrade_policy
+        ) as telemetry_session:
             try:
                 result = await func(*args, **kwargs)
             finally:
                 total_kwh = telemetry_session.energy_kwh
+                model_usage = telemetry_session.model_usage
 
         self._finalize_execution(
             total_kwh,
             schedule_plan,
             forecast_provider=forecast_provider,
-            model=model,
+            model=self._resolve_legacy_model(model, model_usage),
+            model_usage=model_usage,
             metadata=metadata,
         )
         return result
@@ -68,6 +73,7 @@ class ExecutionRunner:
         *,
         forecast_provider: str | None = None,
         model: str | None = None,
+        model_downgrade_policy: ModelDowngradePolicy | None = None,
         metadata: dict[str, str] | None = None,
     ):
         done = threading.Event()
@@ -76,16 +82,20 @@ class ExecutionRunner:
         def run_later():
             try:
                 logger.info("Greener window reached. Proceeding with execution.")
-                with self._telemetry_runtime.session() as telemetry_session:
+                with self._telemetry_runtime.session(
+                    model_downgrade_policy=model_downgrade_policy
+                ) as telemetry_session:
                     try:
                         outcome["result"] = func(*args, **kwargs)
                     finally:
                         total_kwh = telemetry_session.energy_kwh
+                        model_usage = telemetry_session.model_usage
                 self._finalize_execution(
                     total_kwh,
                     schedule_plan,
                     forecast_provider=forecast_provider,
-                    model=model,
+                    model=self._resolve_legacy_model(model, model_usage),
+                    model_usage=model_usage,
                     metadata=metadata,
                 )
             except BaseException as exc:
@@ -139,6 +149,7 @@ class ExecutionRunner:
         *,
         forecast_provider: str | None = None,
         model: str | None = None,
+        model_usage: tuple[ModelUsageSummary, ...] = (),
         metadata: dict[str, str] | None = None,
     ) -> None:
         if total_kwh <= 0:
@@ -161,6 +172,18 @@ class ExecutionRunner:
                 forecast_provider=forecast_provider,
                 llm_provider=self._llm_provider,
                 model=model,
+                model_usage=model_usage,
                 metadata=dict(metadata or {}),
             )
         )
+
+    @staticmethod
+    def _resolve_legacy_model(
+        model: str | None,
+        model_usage: tuple[ModelUsageSummary, ...],
+    ) -> str | None:
+        if model is not None:
+            return model
+        if len(model_usage) != 1:
+            return None
+        return model_usage[0].effective_model

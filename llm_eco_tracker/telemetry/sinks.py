@@ -5,7 +5,7 @@ import logging
 from pathlib import Path
 from typing import Any
 
-from ..models import ForecastInterval, SchedulePlan, TelemetryRecord
+from ..models import ForecastInterval, ModelUsageSummary, SchedulePlan, TelemetryRecord
 from .base import TelemetrySink
 
 logger = logging.getLogger(__name__)
@@ -66,6 +66,10 @@ def _serialize_record(record: TelemetryRecord) -> dict[str, Any]:
         payload["llm_provider"] = record.llm_provider
     if record.model is not None:
         payload["model"] = record.model
+    if record.model_usage:
+        payload["model_usage"] = [
+            _serialize_model_usage(model_usage) for model_usage in record.model_usage
+        ]
     if record.metadata:
         payload["metadata"] = dict(record.metadata)
 
@@ -91,4 +95,13 @@ def _serialize_forecast_interval(interval: ForecastInterval | None) -> dict[str,
         "starts_at": interval.starts_at.isoformat(),
         "ends_at": interval.ends_at.isoformat(),
         "carbon_intensity_gco2eq_per_kwh": interval.carbon_intensity_gco2eq_per_kwh,
+    }
+
+
+def _serialize_model_usage(model_usage: ModelUsageSummary) -> dict[str, Any]:
+    return {
+        "requested_model": model_usage.requested_model,
+        "effective_model": model_usage.effective_model,
+        "call_count": model_usage.call_count,
+        "downgraded": model_usage.downgraded,
     }

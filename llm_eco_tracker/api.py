@@ -1,8 +1,10 @@
 import functools
 import inspect
 import logging
+from collections.abc import Mapping
 from pathlib import Path
 
+from .downgrade import build_model_downgrade_policy
 from .execution import ExecutionRunner
 from .models import SchedulePlan
 from .planning import (
@@ -71,6 +73,9 @@ def carbon_aware(
     max_delay_hours: int = 2,
     forecast_provider: ForecastProvider | None = None,
     telemetry_sink: TelemetrySink | None = None,
+    auto_downgrade: bool = False,
+    dirty_threshold: float = 300.0,
+    model_fallbacks: Mapping[str, str] | None = None,
 ):
     """
     Delay non-urgent work until a greener grid window, then record session-wide
@@ -80,6 +85,9 @@ def carbon_aware(
         max_delay_hours (int): Maximum time to wait for a greener grid window.
         forecast_provider (ForecastProvider | None): Source of carbon-intensity forecasts.
         telemetry_sink (TelemetrySink | None): Destination for normalized telemetry records.
+        auto_downgrade (bool): Rewrite supported model requests on dirty grids.
+        dirty_threshold (float): Grid intensity threshold for model downgrading.
+        model_fallbacks (Mapping[str, str] | None): Additional exact-match model fallbacks.
     """
 
     resolved_forecast_provider = _resolve_forecast_provider(forecast_provider)
@@ -96,6 +104,11 @@ def carbon_aware(
             "Forecast provider: %s, max delay: %sh",
             resolved_forecast_provider.provider_name,
             max_delay_hours,
+        )
+        logger.info(
+            "Auto downgrade: %s, dirty threshold: %.1f gCO2eq/kWh",
+            auto_downgrade,
+            dirty_threshold,
         )
 
     def _build_delay_plan():
@@ -119,12 +132,19 @@ def carbon_aware(
             async def async_wrapper(*args, **kwargs):
                 _log_intercept(func)
                 schedule_plan = _build_delay_plan()
+                model_downgrade_policy = build_model_downgrade_policy(
+                    schedule_plan,
+                    auto_downgrade=auto_downgrade,
+                    dirty_threshold=dirty_threshold,
+                    model_fallbacks=model_fallbacks,
+                )
                 return await execution_runner.run_async(
                     func,
                     args,
                     kwargs,
                     schedule_plan,
                     forecast_provider=resolved_forecast_provider.provider_name,
+                    model_downgrade_policy=model_downgrade_policy,
                 )
 
             return async_wrapper
@@ -133,12 +153,19 @@ def carbon_aware(
         def sync_wrapper(*args, **kwargs):
             _log_intercept(func)
             schedule_plan = _build_delay_plan()
+            model_downgrade_policy = build_model_downgrade_policy(
+                schedule_plan,
+                auto_downgrade=auto_downgrade,
+                dirty_threshold=dirty_threshold,
+                model_fallbacks=model_fallbacks,
+            )
             return execution_runner.run_sync(
                 func,
                 args,
                 kwargs,
                 schedule_plan,
                 forecast_provider=resolved_forecast_provider.provider_name,
+                model_downgrade_policy=model_downgrade_policy,
             )
 
         return sync_wrapper
