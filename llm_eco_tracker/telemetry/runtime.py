@@ -6,7 +6,8 @@ import threading
 from collections.abc import Sequence
 from dataclasses import dataclass, field
 
-from ..models import ModelDowngradePolicy, ModelUsageSummary
+from ..errors import CarbonBudgetExceededError
+from ..models import CarbonBudgetPolicy, ModelDowngradePolicy, ModelUsageSummary
 from .base import TelemetryAdapter
 
 logger = logging.getLogger(__name__)
@@ -21,9 +22,20 @@ def _disabled_model_downgrade_policy() -> ModelDowngradePolicy:
     )
 
 
+def _disabled_carbon_budget_policy() -> CarbonBudgetPolicy:
+    return CarbonBudgetPolicy(
+        enabled=False,
+        max_session_gco2eq=None,
+        actual_intensity_gco2eq_per_kwh=0.0,
+    )
+
+
 @dataclass(slots=True)
 class _SessionState:
     energy_kwh: float = 0.0
+    actual_gco2eq_so_far: float = 0.0
+    carbon_budget_policy: CarbonBudgetPolicy = field(default_factory=_disabled_carbon_budget_policy)
+    carbon_budget_exceeded: bool = False
     model_downgrade_policy: ModelDowngradePolicy = field(
         default_factory=_disabled_model_downgrade_policy
     )
@@ -53,19 +65,32 @@ class EcoTelemetrySession:
         self,
         runtime: "EcoLogitsRuntime",
         *,
+        carbon_budget_policy: CarbonBudgetPolicy | None = None,
         model_downgrade_policy: ModelDowngradePolicy | None = None,
     ):
         self._runtime = runtime
+        self._carbon_budget_policy = carbon_budget_policy or _disabled_carbon_budget_policy()
         self._model_downgrade_policy = model_downgrade_policy or _disabled_model_downgrade_policy()
         self._state: _SessionState | None = None
         self._token = None
         self._patch_enabled = False
 
     def __enter__(self):
-        self._state = _SessionState(model_downgrade_policy=self._model_downgrade_policy)
+        self._state = _SessionState(
+            carbon_budget_policy=self._carbon_budget_policy,
+            model_downgrade_policy=self._model_downgrade_policy,
+        )
         self._token = self._runtime._session_state.set(self._state)
-        self._runtime._ensure_ecologits_initialized()
+        ecologits_ready = self._runtime._ensure_ecologits_initialized()
         self._patch_enabled = self._runtime._install_adapters()
+        if self._carbon_budget_policy.enabled and not self._carbon_budget_policy.is_enforced:
+            logger.warning(
+                "Carbon circuit breaker is configured but cannot be enforced because execution carbon intensity is unavailable."
+            )
+        elif self._carbon_budget_policy.enabled and (not ecologits_ready or not self._patch_enabled):
+            logger.warning(
+                "Carbon circuit breaker is configured, but energy tracking is unavailable for this session."
+            )
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
@@ -80,6 +105,18 @@ class EcoTelemetrySession:
         return float(self._state.energy_kwh)
 
     @property
+    def actual_gco2eq_so_far(self) -> float:
+        if self._state is None:
+            return 0.0
+        return float(self._state.actual_gco2eq_so_far)
+
+    @property
+    def carbon_budget_exceeded(self) -> bool:
+        if self._state is None:
+            return False
+        return bool(self._state.carbon_budget_exceeded)
+
+    @property
     def model_usage(self) -> tuple[ModelUsageSummary, ...]:
         if self._state is None:
             return ()
@@ -92,6 +129,20 @@ class EcoTelemetrySession:
             )
             for (requested_model, effective_model), call_count in self._state.model_usage_counts.items()
         )
+
+    @property
+    def session_metadata(self) -> dict[str, float | bool | str]:
+        if self._state is None or not self._state.carbon_budget_policy.enabled:
+            return {}
+
+        metadata: dict[str, float | bool | str] = {
+            "max_session_gco2eq": float(self._state.carbon_budget_policy.max_session_gco2eq or 0.0),
+            "actual_gco2eq_so_far": float(self._state.actual_gco2eq_so_far),
+            "carbon_budget_exceeded": bool(self._state.carbon_budget_exceeded),
+        }
+        if self._state.carbon_budget_exceeded:
+            metadata["termination_reason"] = "carbon_budget_exceeded"
+        return metadata
 
 
 class EcoLogitsRuntime:
@@ -114,9 +165,14 @@ class EcoLogitsRuntime:
     def session(
         self,
         *,
+        carbon_budget_policy: CarbonBudgetPolicy | None = None,
         model_downgrade_policy: ModelDowngradePolicy | None = None,
     ) -> EcoTelemetrySession:
-        return EcoTelemetrySession(self, model_downgrade_policy=model_downgrade_policy)
+        return EcoTelemetrySession(
+            self,
+            carbon_budget_policy=carbon_budget_policy,
+            model_downgrade_policy=model_downgrade_policy,
+        )
 
     def _ensure_ecologits_initialized(self) -> bool:
         if self._ecologits_initialized:
@@ -210,9 +266,29 @@ class EcoLogitsRuntime:
             return
 
         try:
-            state.energy_kwh += float(energy_kwh)
+            normalized_energy_kwh = float(energy_kwh)
         except (TypeError, ValueError):
             logger.debug("Skipping non-numeric energy value: %r", energy_kwh)
+            return
+
+        state.energy_kwh += normalized_energy_kwh
+
+        carbon_budget_policy = state.carbon_budget_policy
+        if not carbon_budget_policy.is_enforced:
+            return
+
+        state.actual_gco2eq_so_far += (
+            normalized_energy_kwh * carbon_budget_policy.actual_intensity_gco2eq_per_kwh
+        )
+        if state.actual_gco2eq_so_far <= float(carbon_budget_policy.max_session_gco2eq or 0.0):
+            return
+
+        state.carbon_budget_exceeded = True
+        raise CarbonBudgetExceededError(
+            max_session_gco2eq=float(carbon_budget_policy.max_session_gco2eq or 0.0),
+            actual_gco2eq=state.actual_gco2eq_so_far,
+            energy_kwh=state.energy_kwh,
+        )
 
     def _get_model_downgrade_policy(self) -> ModelDowngradePolicy:
         state = self._session_state.get()

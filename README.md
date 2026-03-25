@@ -33,6 +33,7 @@ carbon_aware(
     auto_downgrade=False,
     dirty_threshold=300.0,
     model_fallbacks=None,
+    max_session_gco2eq=None,
 )
 ```
 
@@ -62,6 +63,7 @@ from llm_eco_tracker.providers import CsvForecastProvider
     max_delay_hours=2,
     forecast_provider=CsvForecastProvider("tests/fixtures/mock_forecast.csv"),
     auto_downgrade=True,
+    max_session_gco2eq=50.0,
 )
 def call_llm_with_csv_forecast(prompt):
     # Your LLM logic here
@@ -84,9 +86,26 @@ You can override or extend that map per decorator call:
     auto_downgrade=True,
     dirty_threshold=300.0,
     model_fallbacks={"custom-large-model": "custom-small-model"},
+    max_session_gco2eq=50.0,
 )
 def call_llm_with_fallbacks(prompt):
     pass
+```
+
+`max_session_gco2eq` enables a hard per-session carbon budget. When one decorated run
+exceeds that emitted-carbon limit, the library raises `CarbonBudgetExceededError`.
+
+```python
+from llm_eco_tracker import CarbonBudgetExceededError, carbon_aware
+
+@carbon_aware(max_session_gco2eq=50.0)
+def run_agent():
+    pass
+
+try:
+    run_agent()
+except CarbonBudgetExceededError as exc:
+    print(exc.actual_gco2eq, exc.max_session_gco2eq)
 ```
 
 ### Telemetry Outputs
@@ -102,7 +121,9 @@ The library currently supports these telemetry sink shapes:
 - `CompositeTelemetrySink`: fans out one telemetry record to multiple sinks.
 
 Telemetry records include per-session `model_usage` summaries so you can see which
-requested models were kept versus downgraded.
+requested models were kept versus downgraded. When the carbon circuit breaker is enabled,
+telemetry metadata also records the configured session budget, the emitted carbon reached
+so far, and whether the run was terminated for exceeding that budget.
 
 ### Telemetry Report CLI
 

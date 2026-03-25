@@ -4,6 +4,7 @@ import logging
 from collections.abc import Mapping
 from pathlib import Path
 
+from .budget import build_carbon_budget_policy
 from .downgrade import build_model_downgrade_policy
 from .execution import ExecutionRunner
 from .models import SchedulePlan
@@ -76,6 +77,7 @@ def carbon_aware(
     auto_downgrade: bool = False,
     dirty_threshold: float = 300.0,
     model_fallbacks: Mapping[str, str] | None = None,
+    max_session_gco2eq: float | None = None,
 ):
     """
     Delay non-urgent work until a greener grid window, then record session-wide
@@ -88,6 +90,7 @@ def carbon_aware(
         auto_downgrade (bool): Rewrite supported model requests on dirty grids.
         dirty_threshold (float): Grid intensity threshold for model downgrading.
         model_fallbacks (Mapping[str, str] | None): Additional exact-match model fallbacks.
+        max_session_gco2eq (float | None): Abort a session after exceeding this emitted-carbon budget.
     """
 
     resolved_forecast_provider = _resolve_forecast_provider(forecast_provider)
@@ -110,6 +113,7 @@ def carbon_aware(
             auto_downgrade,
             dirty_threshold,
         )
+        logger.info("Carbon session budget: %s gCO2eq", max_session_gco2eq)
 
     def _build_delay_plan():
         schedule_plan = _get_schedule_plan(max_delay_hours, resolved_forecast_provider)
@@ -132,6 +136,10 @@ def carbon_aware(
             async def async_wrapper(*args, **kwargs):
                 _log_intercept(func)
                 schedule_plan = _build_delay_plan()
+                carbon_budget_policy = build_carbon_budget_policy(
+                    schedule_plan,
+                    max_session_gco2eq=max_session_gco2eq,
+                )
                 model_downgrade_policy = build_model_downgrade_policy(
                     schedule_plan,
                     auto_downgrade=auto_downgrade,
@@ -144,6 +152,7 @@ def carbon_aware(
                     kwargs,
                     schedule_plan,
                     forecast_provider=resolved_forecast_provider.provider_name,
+                    carbon_budget_policy=carbon_budget_policy,
                     model_downgrade_policy=model_downgrade_policy,
                 )
 
@@ -153,6 +162,10 @@ def carbon_aware(
         def sync_wrapper(*args, **kwargs):
             _log_intercept(func)
             schedule_plan = _build_delay_plan()
+            carbon_budget_policy = build_carbon_budget_policy(
+                schedule_plan,
+                max_session_gco2eq=max_session_gco2eq,
+            )
             model_downgrade_policy = build_model_downgrade_policy(
                 schedule_plan,
                 auto_downgrade=auto_downgrade,
@@ -165,6 +178,7 @@ def carbon_aware(
                 kwargs,
                 schedule_plan,
                 forecast_provider=resolved_forecast_provider.provider_name,
+                carbon_budget_policy=carbon_budget_policy,
                 model_downgrade_policy=model_downgrade_policy,
             )
 

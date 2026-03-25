@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from typing import Any
 from dataclasses import dataclass, field
 from datetime import datetime
 
@@ -71,6 +72,24 @@ class ModelUsageSummary:
 
 
 @dataclass(frozen=True, slots=True)
+class CarbonBudgetPolicy:
+    """Execution-time carbon budget policy for one carbon-aware session."""
+
+    enabled: bool
+    max_session_gco2eq: float | None
+    actual_intensity_gco2eq_per_kwh: float
+
+    @property
+    def is_enforced(self) -> bool:
+        return (
+            self.enabled
+            and self.max_session_gco2eq is not None
+            and self.max_session_gco2eq > 0
+            and self.actual_intensity_gco2eq_per_kwh > 0
+        )
+
+
+@dataclass(frozen=True, slots=True)
 class TelemetryRecord:
     """A telemetry event ready to be written by a sink."""
 
@@ -81,4 +100,4 @@ class TelemetryRecord:
     llm_provider: str | None = None
     model: str | None = None
     model_usage: tuple[ModelUsageSummary, ...] = ()
-    metadata: dict[str, str] = field(default_factory=dict)
+    metadata: dict[str, Any] = field(default_factory=dict)

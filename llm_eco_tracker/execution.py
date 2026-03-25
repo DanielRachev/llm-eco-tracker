@@ -7,7 +7,13 @@ from datetime import datetime, timezone
 from typing import Any
 
 from .emissions import summarize_emissions
-from .models import ModelDowngradePolicy, ModelUsageSummary, SchedulePlan, TelemetryRecord
+from .models import (
+    CarbonBudgetPolicy,
+    ModelDowngradePolicy,
+    ModelUsageSummary,
+    SchedulePlan,
+    TelemetryRecord,
+)
 from .telemetry.base import TelemetrySink
 from .telemetry.runtime import EcoLogitsRuntime
 
@@ -35,8 +41,9 @@ class ExecutionRunner:
         *,
         forecast_provider: str | None = None,
         model: str | None = None,
+        carbon_budget_policy: CarbonBudgetPolicy | None = None,
         model_downgrade_policy: ModelDowngradePolicy | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         self._log_async_delay(schedule_plan)
 
@@ -45,23 +52,30 @@ class ExecutionRunner:
 
         logger.info("Greener window reached. Proceeding with execution.")
 
-        with self._telemetry_runtime.session(
-            model_downgrade_policy=model_downgrade_policy
-        ) as telemetry_session:
-            try:
-                result = await func(*args, **kwargs)
-            finally:
-                total_kwh = telemetry_session.energy_kwh
-                model_usage = telemetry_session.model_usage
+        total_kwh = 0.0
+        model_usage: tuple[ModelUsageSummary, ...] = ()
+        session_metadata: dict[str, Any] = {}
+        try:
+            with self._telemetry_runtime.session(
+                carbon_budget_policy=carbon_budget_policy,
+                model_downgrade_policy=model_downgrade_policy
+            ) as telemetry_session:
+                try:
+                    result = await func(*args, **kwargs)
+                finally:
+                    total_kwh = telemetry_session.energy_kwh
+                    model_usage = telemetry_session.model_usage
+                    session_metadata = telemetry_session.session_metadata
+        finally:
+            self._finalize_execution(
+                total_kwh,
+                schedule_plan,
+                forecast_provider=forecast_provider,
+                model=self._resolve_legacy_model(model, model_usage),
+                model_usage=model_usage,
+                metadata=self._merge_metadata(metadata, session_metadata),
+            )
 
-        self._finalize_execution(
-            total_kwh,
-            schedule_plan,
-            forecast_provider=forecast_provider,
-            model=self._resolve_legacy_model(model, model_usage),
-            model_usage=model_usage,
-            metadata=metadata,
-        )
         return result
 
     def run_sync(
@@ -73,16 +87,21 @@ class ExecutionRunner:
         *,
         forecast_provider: str | None = None,
         model: str | None = None,
+        carbon_budget_policy: CarbonBudgetPolicy | None = None,
         model_downgrade_policy: ModelDowngradePolicy | None = None,
-        metadata: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ):
         done = threading.Event()
         outcome: dict[str, Any] = {}
 
         def run_later():
+            total_kwh = 0.0
+            model_usage: tuple[ModelUsageSummary, ...] = ()
+            session_metadata: dict[str, Any] = {}
             try:
                 logger.info("Greener window reached. Proceeding with execution.")
                 with self._telemetry_runtime.session(
+                    carbon_budget_policy=carbon_budget_policy,
                     model_downgrade_policy=model_downgrade_policy
                 ) as telemetry_session:
                     try:
@@ -90,17 +109,18 @@ class ExecutionRunner:
                     finally:
                         total_kwh = telemetry_session.energy_kwh
                         model_usage = telemetry_session.model_usage
+                        session_metadata = telemetry_session.session_metadata
+            except BaseException as exc:
+                outcome["exception"] = exc
+            finally:
                 self._finalize_execution(
                     total_kwh,
                     schedule_plan,
                     forecast_provider=forecast_provider,
                     model=self._resolve_legacy_model(model, model_usage),
                     model_usage=model_usage,
-                    metadata=metadata,
+                    metadata=self._merge_metadata(metadata, session_metadata),
                 )
-            except BaseException as exc:
-                outcome["exception"] = exc
-            finally:
                 done.set()
 
         timer = self._start_sync_execution(schedule_plan, run_later)
@@ -150,7 +170,7 @@ class ExecutionRunner:
         forecast_provider: str | None = None,
         model: str | None = None,
         model_usage: tuple[ModelUsageSummary, ...] = (),
-        metadata: dict[str, str] | None = None,
+        metadata: dict[str, Any] | None = None,
     ) -> None:
         if total_kwh <= 0:
             logger.info("Session complete. No EcoLogits energy impacts were captured.")
@@ -187,3 +207,12 @@ class ExecutionRunner:
         if len(model_usage) != 1:
             return None
         return model_usage[0].effective_model
+
+    @staticmethod
+    def _merge_metadata(
+        metadata: dict[str, Any] | None,
+        session_metadata: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        merged_metadata = dict(metadata or {})
+        merged_metadata.update(session_metadata or {})
+        return merged_metadata
