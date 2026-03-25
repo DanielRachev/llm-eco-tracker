@@ -64,6 +64,41 @@ def call_llm_with_csv_forecast(prompt):
     pass
 ```
 
+### Telemetry Outputs
+
+By default, `@carbon_aware` writes normalized telemetry records to `eco_telemetry.jsonl`
+in the current working directory.
+
+The library currently supports these telemetry sink shapes:
+
+- `JsonlTelemetrySink`: writes one serialized telemetry payload per line.
+- `LoggerTelemetrySink`: emits `Telemetry record: {...}` through Python logging.
+- `NoOpTelemetrySink`: discards telemetry records.
+- `CompositeTelemetrySink`: fans out one telemetry record to multiple sinks.
+
+### Telemetry Report CLI
+
+You can summarize lifetime telemetry directly from the package with:
+
+```bash
+python -m llm_eco_tracker.report
+```
+
+You can also point it at one or more custom inputs:
+
+```bash
+python -m llm_eco_tracker.report path/to/eco_telemetry.jsonl
+python -m llm_eco_tracker.report telemetry-a.jsonl telemetry-b.jsonl
+python -m llm_eco_tracker.report app.log --format logger
+```
+
+The report command auto-detects JSONL versus logger-backed inputs by default and prints:
+
+- Total LLM jobs run
+- Total gCO2eq emitted
+- Total gCO2eq saved by EcoTracker
+- A car-travel equivalence based on emitted gCO2eq
+
 ### Fixture Data
 
 The repository includes a CSV fixture at `tests/fixtures/mock_forecast.csv`.
