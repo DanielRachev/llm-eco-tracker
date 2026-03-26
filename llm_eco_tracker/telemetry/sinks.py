@@ -84,6 +84,7 @@ def _serialize_schedule_plan(schedule_plan: SchedulePlan) -> dict[str, Any]:
         "optimal_intensity_gco2eq_per_kwh": schedule_plan.optimal_intensity_gco2eq_per_kwh,
         "raw_delay_seconds": schedule_plan.raw_delay_seconds,
         "execution_delay_seconds": schedule_plan.execution_delay_seconds,
+        "latest_execution_delay_seconds": schedule_plan.latest_execution_delay_seconds,
     }
 
 

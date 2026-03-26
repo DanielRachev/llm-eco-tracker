@@ -32,6 +32,7 @@ class SchedulePlan:
     optimal_intensity_gco2eq_per_kwh: float
     raw_delay_seconds: float
     execution_delay_seconds: float
+    latest_execution_delay_seconds: float = 0.0
 
 
 @dataclass(frozen=True, slots=True)
