@@ -220,3 +220,7 @@ eco_telemetry.jsonl
 
 # Experiment results
 experiment_results.csv
+trace_benchmark_results.csv
+trace_benchmark_telemetry.jsonl
+openai_integration_summary.json
+openai_integration_telemetry.jsonl

@@ -3,6 +3,7 @@ from __future__ import annotations
 import functools
 import inspect
 import logging
+from numbers import Real
 
 from ..base import TelemetrySessionHooks
 
@@ -142,7 +143,30 @@ class OpenAIChatCompletionsAdapter:
     def _record_response_energy(response, session_hooks: TelemetrySessionHooks) -> None:
         impacts = getattr(response, "impacts", None)
         energy = getattr(getattr(impacts, "energy", None), "value", None)
-        if energy is None:
+        normalized_energy = OpenAIChatCompletionsAdapter._normalize_energy_value(energy)
+        if normalized_energy is None:
             return
 
-        session_hooks.record_energy_kwh(energy)
+        session_hooks.record_energy_kwh(normalized_energy)
+
+    @staticmethod
+    def _normalize_energy_value(energy) -> float | None:
+        if isinstance(energy, Real):
+            return float(energy)
+
+        mean_value = getattr(energy, "mean", None)
+        if isinstance(mean_value, Real):
+            # EcoLogits reports a min/max range for some models; use its midpoint
+            # so session totals remain comparable to other scalar energy sources.
+            return float(mean_value)
+
+        minimum = getattr(energy, "min", None)
+        maximum = getattr(energy, "max", None)
+        if isinstance(minimum, Real) and isinstance(maximum, Real):
+            return float((minimum + maximum) / 2.0)
+        if isinstance(minimum, Real):
+            return float(minimum)
+        if isinstance(maximum, Real):
+            return float(maximum)
+
+        return None

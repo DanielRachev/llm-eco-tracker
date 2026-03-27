@@ -157,6 +157,24 @@ To refresh it from the UK Carbon Intensity API, run:
 python scripts/download_mock_data.py
 ```
 
+### Benchmark Scripts
+
+The repository includes two benchmark scripts for evaluation:
+
+- `python scripts/run_benchmark.py`
+  Runs the trace-driven scheduler benchmark. By default it sweeps 48 submission
+  times from `tests/fixtures/mock_forecast.csv`, fast-forwards waiting, disables
+  scheduler jitter for reproducibility, and writes:
+  - `trace_benchmark_results.csv`
+  - `trace_benchmark_telemetry.jsonl`
+
+- `python scripts/run_openai_integration_benchmark.py`
+  Runs an end-to-end OpenAI SDK benchmark using `AsyncOpenAI` with an
+  `httpx.MockTransport`, so the request path is real but no paid API call is
+  made. It writes:
+  - `openai_integration_telemetry.jsonl`
+  - `openai_integration_summary.json`
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
