@@ -5,7 +5,7 @@
 ## Features
 
 - **Carbon-Aware Scheduling**: Delay execution based on forecasted grid carbon intensity.
-- **Forecast Providers**: Use the live UK Carbon Intensity API or inject a CSV-backed provider for deterministic runs.
+- **Forecast Providers**: Use the live UK Carbon Intensity API, Electricity Maps, or inject a CSV-backed provider for deterministic runs.
 - **Telemetry Adapters**: Current telemetry support is wired for both OpenAI chat completions and Anthropic messages through EcoLogits.
 
 ## Installation
@@ -67,6 +67,25 @@ from llm_eco_tracker.providers import CsvForecastProvider
 )
 def call_llm_with_csv_forecast(prompt):
     # Your LLM logic here
+    pass
+```
+
+```python
+import os
+
+from llm_eco_tracker import carbon_aware
+from llm_eco_tracker.providers import ElectricityMapsProvider
+
+electricity_maps = ElectricityMapsProvider(
+    zone="DE",
+    auth_token=os.environ["ELECTRICITY_MAPS_API_TOKEN"],
+)
+
+@carbon_aware(
+    max_delay_hours=2,
+    forecast_provider=electricity_maps,
+)
+def call_llm_with_electricity_maps(prompt):
     pass
 ```
 
