@@ -1,5 +1,6 @@
 openai
 ecologits
 httpx
+matplotlib
 python-dotenv
 requests

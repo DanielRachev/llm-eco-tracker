@@ -175,6 +175,13 @@ The repository includes two benchmark scripts for evaluation:
   - `openai_integration_telemetry.jsonl`
   - `openai_integration_summary.json`
 
+- `python scripts/generate_paper_figures.py`
+  Reads `trace_benchmark_results.csv` plus the mock forecast CSV and renders
+  paper-ready figures into `paper_figures/` as both PNG and PDF:
+  - `figure_1_curve`
+  - `figure_2_total_emissions`
+  - `figure_3_emissions_profile`
+
 ## License
 
 This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
