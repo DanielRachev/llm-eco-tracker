@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import httpx
 from openai import AsyncOpenAI, OpenAI
+from openai.resources.chat.completions import AsyncCompletions, Completions
 
 from llm_eco_tracker import api
 from llm_eco_tracker.models import ForecastInterval, ForecastSnapshot
@@ -19,6 +20,27 @@ from llm_eco_tracker.telemetry.runtime import EcoLogitsRuntime
 
 
 class RealOpenAITelemetryTests(unittest.TestCase):
+    def test_runtime_restores_openai_create_methods_to_stable_post_init_state(self):
+        runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
+        raw_sync_create = Completions.__dict__["create"]
+        raw_async_create = AsyncCompletions.__dict__["create"]
+
+        with patch("ecologits.log.logger.warning_once", return_value=None):
+            with runtime.session():
+                self.assertIsNot(Completions.__dict__["create"], raw_sync_create)
+                self.assertIsNot(AsyncCompletions.__dict__["create"], raw_async_create)
+
+        stabilized_sync_create = Completions.__dict__["create"]
+        stabilized_async_create = AsyncCompletions.__dict__["create"]
+
+        with patch("ecologits.log.logger.warning_once", return_value=None):
+            with runtime.session():
+                self.assertIsNot(Completions.__dict__["create"], stabilized_sync_create)
+                self.assertIsNot(AsyncCompletions.__dict__["create"], stabilized_async_create)
+
+        self.assertIs(Completions.__dict__["create"], stabilized_sync_create)
+        self.assertIs(AsyncCompletions.__dict__["create"], stabilized_async_create)
+
     def test_runtime_records_mean_energy_from_real_openai_response(self):
         client = _build_sync_client()
         runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])

@@ -1,270 +1,433 @@
 import argparse
-import asyncio
 import csv
+import json
 import logging
+import statistics
 import sys
-from contextlib import ExitStack
-from datetime import timedelta
+from collections import defaultdict
+from datetime import date, timedelta
 from pathlib import Path
-from unittest.mock import patch
+from typing import Any
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
     sys.path.insert(0, str(BASE_DIR))
 
-from llm_eco_tracker.api import _default_telemetry_runtime, carbon_aware
 from llm_eco_tracker.benchmarking import (
-    SlidingCsvForecastProvider,
-    iter_submission_offsets,
-    load_actual_intensity_mapping,
-    mock_sleep,
-    read_last_new_jsonl_record,
-    reset_output_file,
-    lookup_actual_intensity,
+    build_trace_schedule_plan,
+    contiguous_date_window,
+    format_iso_date,
+    group_complete_trace_days,
+    last_completed_utc_day,
+    load_trace_intervals,
+    parse_iso_date,
+    summarize_trace_days,
 )
 from llm_eco_tracker.emissions import summarize_emissions
-from llm_eco_tracker.telemetry import JsonlTelemetrySink
 
-DEFAULT_CSV = BASE_DIR / "tests" / "fixtures" / "mock_forecast.csv"
-DEFAULT_RESULTS_CSV = BASE_DIR / "trace_benchmark_results.csv"
-DEFAULT_TELEMETRY_PATH = BASE_DIR / "trace_benchmark_telemetry.jsonl"
+DEFAULT_CSV = BASE_DIR / "tests" / "fixtures" / "benchmark_trace.csv"
+DEFAULT_SCENARIO_RESULTS_CSV = BASE_DIR / "scenario_results.csv"
+DEFAULT_DAILY_SUMMARY_CSV = BASE_DIR / "daily_summary.csv"
+DEFAULT_SUMMARY_JSON = BASE_DIR / "benchmark_summary.json"
 
 DEFAULT_CALL_COUNT = 50
-DEFAULT_SWEEP_LIMIT = 48
-DEFAULT_MAX_DELAY_HOURS = 4
 DEFAULT_ENERGY_PER_CALL_KWH = 0.00001
+DEFAULT_MAX_DELAY_HOURS = 4.0
+DEFAULT_SUBMISSION_STEP = 1
 
-# Keep benchmark output readable.
 logging.getLogger("llm_eco_tracker").setLevel(logging.ERROR)
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="EcoTracker trace-driven scheduler benchmark")
+    parser = argparse.ArgumentParser(description="EcoTracker multi-day trace benchmark")
     parser.add_argument("--csv-path", type=Path, default=DEFAULT_CSV)
-    parser.add_argument("--results-csv", type=Path, default=DEFAULT_RESULTS_CSV)
-    parser.add_argument("--telemetry-path", type=Path, default=DEFAULT_TELEMETRY_PATH)
-    parser.add_argument("--start-offset", type=int, default=0)
-    parser.add_argument("--limit", type=int, default=DEFAULT_SWEEP_LIMIT)
-    parser.add_argument("--step", type=int, default=1)
+    parser.add_argument("--scenario-results-csv", type=Path, default=DEFAULT_SCENARIO_RESULTS_CSV)
+    parser.add_argument("--daily-summary-csv", type=Path, default=DEFAULT_DAILY_SUMMARY_CSV)
+    parser.add_argument("--summary-json", type=Path, default=DEFAULT_SUMMARY_JSON)
     parser.add_argument("--call-count", type=int, default=DEFAULT_CALL_COUNT)
-    parser.add_argument("--max-delay-hours", type=float, default=DEFAULT_MAX_DELAY_HOURS)
     parser.add_argument("--energy-per-call-kwh", type=float, default=DEFAULT_ENERGY_PER_CALL_KWH)
+    parser.add_argument("--max-delay-hours", type=float, default=DEFAULT_MAX_DELAY_HOURS)
+    parser.add_argument("--submission-step", type=int, default=DEFAULT_SUBMISSION_STEP)
+    parser.add_argument("--start-day", type=str, default=None, help="Inclusive ISO day, for example 2026-03-18")
+    parser.add_argument("--end-day", type=str, default=None, help="Inclusive ISO day, for example 2026-03-20")
+    parser.add_argument("--limit-days", type=int, default=None)
     parser.add_argument(
-        "--real-sleep",
-        action="store_true",
-        help="Use real scheduler waiting instead of fast-forwarding through sleeps.",
-    )
-    parser.add_argument(
-        "--keep-jitter",
-        action="store_true",
-        help="Keep scheduler jitter enabled instead of forcing deterministic delay selection.",
+        "--last-n-days",
+        type=int,
+        default=None,
+        help="Convenience filter: evaluate the last N eligible complete days in the trace.",
     )
     return parser.parse_args()
 
 
-async def simulate_llm_job(call_count: int, energy_per_call_kwh: float) -> None:
-    for _ in range(call_count):
-        _default_telemetry_runtime._record_energy(energy_per_call_kwh)
+def write_rows(path: Path, rows: list[dict[str, Any]]) -> None:
+    if not rows:
+        raise RuntimeError(f"No rows were available to write to '{path}'.")
 
-
-async def run_baseline_job(call_count: int, energy_per_call_kwh: float) -> float:
-    with _default_telemetry_runtime.session() as session:
-        await simulate_llm_job(call_count, energy_per_call_kwh)
-        return session.energy_kwh
-
-
-def build_carbon_aware_job(
-    provider: SlidingCsvForecastProvider,
-    telemetry_sink: JsonlTelemetrySink,
-    *,
-    max_delay_hours: float,
-):
-    @carbon_aware(
-        max_delay_hours=max_delay_hours,
-        forecast_provider=provider,
-        telemetry_sink=telemetry_sink,
-    )
-    async def run_job(call_count: int, energy_per_call_kwh: float) -> None:
-        await simulate_llm_job(call_count, energy_per_call_kwh)
-
-    return run_job
-
-
-def identity_schedule_plan(schedule_plan, *args, **kwargs):
-    del args, kwargs
-    return schedule_plan
-
-
-def write_results(results_csv: Path, results: list[dict[str, object]]) -> None:
-    if not results:
-        raise RuntimeError("No benchmark results were produced.")
-
-    results_csv.parent.mkdir(parents=True, exist_ok=True)
-    with results_csv.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=list(results[0].keys()))
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0].keys()))
         writer.writeheader()
-        writer.writerows(results)
+        writer.writerows(rows)
 
 
-def print_summary(
-    results: list[dict[str, object]],
+def write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
+
+
+def compare_values(left: float, right: float, *, tolerance: float = 1e-12) -> str:
+    delta = left - right
+    if delta > tolerance:
+        return "improved"
+    if delta < -tolerance:
+        return "worse"
+    return "tied"
+
+
+def summarize_capture_ratio(actual_saved: float, oracle_saved: float) -> float | None:
+    if oracle_saved <= 0:
+        return None
+    return actual_saved / oracle_saved
+
+
+def percentile(values: list[float], q: float) -> float:
+    if not values:
+        return 0.0
+    if len(values) == 1:
+        return float(values[0])
+
+    sorted_values = sorted(values)
+    index = (len(sorted_values) - 1) * q
+    lower = int(index)
+    upper = min(lower + 1, len(sorted_values) - 1)
+    fraction = index - lower
+    return (sorted_values[lower] * (1.0 - fraction)) + (sorted_values[upper] * fraction)
+
+
+def resolve_day_filters(args: argparse.Namespace) -> tuple[date | None, date | None]:
+    start_day = parse_iso_date(args.start_day) if args.start_day else None
+    end_day = parse_iso_date(args.end_day) if args.end_day else None
+    if start_day and end_day and start_day > end_day:
+        raise ValueError("start_day must be on or before end_day.")
+
+    if args.last_n_days is not None:
+        if args.last_n_days <= 0:
+            raise ValueError("last_n_days must be positive when provided.")
+        derived_end_day = end_day or last_completed_utc_day()
+        derived_start_day, derived_end_day = contiguous_date_window(
+            derived_end_day,
+            days=args.last_n_days,
+        )
+        start_day = start_day or derived_start_day
+        end_day = end_day or derived_end_day
+
+    return start_day, end_day
+
+
+def build_summary_payload(
+    scenario_rows: list[dict[str, Any]],
+    daily_rows: list[dict[str, Any]],
     *,
-    results_csv: Path,
-    telemetry_path: Path,
-    call_count: int,
-    max_delay_hours: float,
-    fast_forwarded: bool,
-    jitter_enabled: bool,
-) -> None:
-    baseline_total = sum(float(row["baseline_actual_gco2eq"]) for row in results)
-    carbon_aware_total = sum(float(row["carbon_aware_actual_gco2eq"]) for row in results)
-    total_reduction_pct = (
-        ((baseline_total - carbon_aware_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
-    )
-    average_reduction_pct = (
-        sum(float(row["saved_pct"]) for row in results) / len(results) if results else 0.0
-    )
-    average_delay_h = (
-        sum(float(row["scheduled_delay_h"]) for row in results) / len(results) if results else 0.0
-    )
-    immediate_runs = sum(1 for row in results if float(row["scheduled_delay_h"]) == 0.0)
+    scenario_results_csv: Path,
+    daily_summary_csv: Path,
+) -> dict[str, Any]:
+    baseline_total = sum(float(row["baseline_actual_gco2eq"]) for row in scenario_rows)
+    ecotracker_total = sum(float(row["ecotracker_actual_gco2eq"]) for row in scenario_rows)
+    oracle_total = sum(float(row["oracle_actual_gco2eq"]) for row in scenario_rows)
 
+    ecotracker_total_reduction_pct = (
+        ((baseline_total - ecotracker_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+    )
+    oracle_total_reduction_pct = (
+        ((baseline_total - oracle_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+    )
+    oracle_capture_ratio = summarize_capture_ratio(
+        baseline_total - ecotracker_total,
+        baseline_total - oracle_total,
+    )
+
+    ecotracker_daily_reductions = [float(row["ecotracker_saved_pct"]) for row in daily_rows]
+    oracle_daily_reductions = [float(row["oracle_saved_pct"]) for row in daily_rows]
+    ecotracker_delays = [float(row["mean_ecotracker_delay_h"]) for row in daily_rows]
+    scenario_delays = [float(row["ecotracker_delay_h"]) for row in scenario_rows]
+
+    improved_scenarios = sum(1 for row in scenario_rows if row["ecotracker_outcome"] == "improved")
+    tied_scenarios = sum(1 for row in scenario_rows if row["ecotracker_outcome"] == "tied")
+    worse_scenarios = sum(1 for row in scenario_rows if row["ecotracker_outcome"] == "worse")
+    improved_days = sum(1 for row in daily_rows if row["ecotracker_day_outcome"] == "improved")
+    tied_days = sum(1 for row in daily_rows if row["ecotracker_day_outcome"] == "tied")
+    worse_days = sum(1 for row in daily_rows if row["ecotracker_day_outcome"] == "worse")
+
+    return {
+        "day_count": len(daily_rows),
+        "scenario_count": len(scenario_rows),
+        "baseline_total_gco2eq": baseline_total,
+        "ecotracker_total_gco2eq": ecotracker_total,
+        "oracle_total_gco2eq": oracle_total,
+        "ecotracker_total_reduction_pct": ecotracker_total_reduction_pct,
+        "oracle_total_reduction_pct": oracle_total_reduction_pct,
+        "aggregate_oracle_capture_ratio": oracle_capture_ratio,
+        "mean_daily_ecotracker_reduction_pct": statistics.mean(ecotracker_daily_reductions),
+        "median_daily_ecotracker_reduction_pct": statistics.median(ecotracker_daily_reductions),
+        "mean_daily_oracle_reduction_pct": statistics.mean(oracle_daily_reductions),
+        "mean_daily_ecotracker_delay_h": statistics.mean(ecotracker_delays),
+        "median_scenario_ecotracker_delay_h": statistics.median(scenario_delays),
+        "p95_scenario_ecotracker_delay_h": percentile(scenario_delays, 0.95),
+        "improved_scenarios": improved_scenarios,
+        "tied_scenarios": tied_scenarios,
+        "worse_scenarios": worse_scenarios,
+        "improved_days": improved_days,
+        "tied_days": tied_days,
+        "worse_days": worse_days,
+        "scenario_results_csv": str(scenario_results_csv),
+        "daily_summary_csv": str(daily_summary_csv),
+    }
+
+
+def print_summary(summary: dict[str, Any], *, max_delay_hours: float, job_energy_kwh: float) -> None:
     print("=" * 72)
-    print("TRACE-DRIVEN SCHEDULER BENCHMARK")
+    print("MULTI-DAY TRACE BENCHMARK")
     print("=" * 72)
-    print(f"Scenarios swept:         {len(results)} submission times")
-    print(f"Calls per job:           {call_count}")
-    print(f"Max delay budget:        {max_delay_hours:.2f} h")
-    print(f"Fast-forward sleep:      {fast_forwarded}")
-    print(f"Deterministic jitter:    {not jitter_enabled}")
-    print(f"Immediate executions:    {immediate_runs}")
-    print(f"Average delay:           {average_delay_h:.2f} h")
-    print(f"Average reduction:       {average_reduction_pct:.2f}%")
-    print(f"Weighted total reduction:{total_reduction_pct:.2f}%")
-    print(f"Baseline total:          {baseline_total:.6f} gCO2eq")
-    print(f"Carbon-aware total:      {carbon_aware_total:.6f} gCO2eq")
-    print(f"Saved total:             {baseline_total - carbon_aware_total:.6f} gCO2eq")
-    print(f"Results CSV:             {results_csv}")
-    print(f"Telemetry JSONL:         {telemetry_path}")
+    print(f"Independent days:                {summary['day_count']}")
+    print(f"Submission scenarios:            {summary['scenario_count']}")
+    print(f"Job energy:                      {job_energy_kwh:.8f} kWh")
+    print(f"Max delay budget:                {max_delay_hours:.2f} h")
+    print(f"Baseline total:                  {summary['baseline_total_gco2eq']:.6f} gCO2eq")
+    print(f"EcoTracker total:                {summary['ecotracker_total_gco2eq']:.6f} gCO2eq")
+    print(f"Oracle total:                    {summary['oracle_total_gco2eq']:.6f} gCO2eq")
+    print(f"EcoTracker total reduction:      {summary['ecotracker_total_reduction_pct']:.2f}%")
+    print(f"Oracle total reduction:          {summary['oracle_total_reduction_pct']:.2f}%")
+    aggregate_capture_ratio = summary["aggregate_oracle_capture_ratio"]
+    if aggregate_capture_ratio is None:
+        print("Aggregate Oracle capture ratio:  n/a")
+    else:
+        print(f"Aggregate Oracle capture ratio:  {aggregate_capture_ratio * 100.0:.2f}%")
+    print(f"Mean daily reduction:            {summary['mean_daily_ecotracker_reduction_pct']:.2f}%")
+    print(f"Median daily reduction:          {summary['median_daily_ecotracker_reduction_pct']:.2f}%")
+    print(f"Mean daily delay:                {summary['mean_daily_ecotracker_delay_h']:.2f} h")
+    print(f"Median scenario delay:           {summary['median_scenario_ecotracker_delay_h']:.2f} h")
+    print(f"Scenario outcomes:               {summary['improved_scenarios']} improved, {summary['tied_scenarios']} tied, {summary['worse_scenarios']} worse")
+    print(f"Day outcomes:                    {summary['improved_days']} improved, {summary['tied_days']} tied, {summary['worse_days']} worse")
+    print(f"Scenario results CSV:            {summary['scenario_results_csv']}")
+    print(f"Daily summary CSV:               {summary['daily_summary_csv']}")
     print("=" * 72)
 
 
-async def run_benchmark() -> None:
+def run_benchmark() -> None:
     args = parse_args()
+    if args.call_count <= 0:
+        raise ValueError("call_count must be positive.")
+    if args.energy_per_call_kwh <= 0:
+        raise ValueError("energy_per_call_kwh must be positive.")
+    if args.max_delay_hours < 0:
+        raise ValueError("max_delay_hours must be non-negative.")
+    if args.submission_step <= 0:
+        raise ValueError("submission_step must be positive.")
 
-    provider = SlidingCsvForecastProvider(args.csv_path)
-    actual_mapping = load_actual_intensity_mapping(args.csv_path)
-    offsets = iter_submission_offsets(
-        provider.interval_count,
-        start_offset=args.start_offset,
-        limit=args.limit,
-        step=args.step,
-    )
-    telemetry_path = reset_output_file(args.telemetry_path)
-    telemetry_sink = JsonlTelemetrySink(telemetry_path)
-    carbon_aware_job = build_carbon_aware_job(
-        provider,
-        telemetry_sink,
+    start_day, end_day = resolve_day_filters(args)
+    trace_intervals = load_trace_intervals(args.csv_path)
+    trace_days = group_complete_trace_days(
+        trace_intervals,
         max_delay_hours=args.max_delay_hours,
     )
+    trace_days = summarize_trace_days(
+        trace_days,
+        start_day=start_day,
+        end_day=end_day,
+        limit_days=args.limit_days,
+    )
+    if not trace_days:
+        raise RuntimeError("No eligible complete trace days were found for the selected filters.")
 
-    results: list[dict[str, object]] = []
-    telemetry_count = 0
+    job_energy_kwh = args.call_count * args.energy_per_call_kwh
 
-    with ExitStack() as stack:
-        if not args.real_sleep:
-            stack.enter_context(
-                patch("llm_eco_tracker.execution.asyncio.sleep", side_effect=mock_sleep)
-            )
-        if not args.keep_jitter:
-            stack.enter_context(
-                patch(
-                    "llm_eco_tracker.api.apply_jitter_to_plan",
-                    side_effect=identity_schedule_plan,
-                )
-            )
+    scenario_rows: list[dict[str, Any]] = []
+    daily_accumulators: dict[str, dict[str, Any]] = defaultdict(
+        lambda: {
+            "baseline_total": 0.0,
+            "ecotracker_total": 0.0,
+            "oracle_total": 0.0,
+            "ecotracker_delay_hours": [],
+            "oracle_delay_hours": [],
+            "scenario_count": 0,
+            "ecotracker_improved": 0,
+            "ecotracker_tied": 0,
+            "ecotracker_worse": 0,
+        }
+    )
 
-        for scenario_index, start_offset in enumerate(offsets, start=1):
-            provider.set_start_offset(start_offset)
-            submission_interval = provider.current_interval
-            submission_time = submission_interval.starts_at
-            baseline_actual_intensity = actual_mapping.get(
-                submission_time.strftime("%Y-%m-%dT%H:%MZ"),
-                submission_interval.carbon_intensity_gco2eq_per_kwh,
-            )
-
-            baseline_energy_kwh = await run_baseline_job(
-                args.call_count,
-                args.energy_per_call_kwh,
-            )
-            baseline_summary = summarize_emissions(
-                baseline_energy_kwh,
-                baseline_actual_intensity,
-                baseline_actual_intensity,
-            )
-
-            await carbon_aware_job(args.call_count, args.energy_per_call_kwh)
-            telemetry_record, telemetry_count = read_last_new_jsonl_record(
-                telemetry_path,
-                telemetry_count,
+    scenario_index = 0
+    for day_index, trace_day in enumerate(trace_days, start=1):
+        for submission_slot, submission_offset in enumerate(
+            trace_day.submission_offsets[:: args.submission_step],
+            start=1,
+        ):
+            scenario_index += 1
+            submission_interval = trace_intervals[submission_offset]
+            baseline_result = summarize_emissions(
+                job_energy_kwh,
+                submission_interval.actual_intensity_gco2eq_per_kwh,
+                submission_interval.actual_intensity_gco2eq_per_kwh,
             )
 
-            delay_seconds = float(telemetry_record["schedule_plan"]["execution_delay_seconds"])
-            scheduled_time = submission_time + timedelta(seconds=delay_seconds)
-            actual_intensity_at_run = lookup_actual_intensity(
-                actual_mapping,
-                scheduled_time,
-                fallback=baseline_actual_intensity,
+            ecotracker_plan, ecotracker_offset = build_trace_schedule_plan(
+                trace_intervals,
+                submission_offset,
+                args.max_delay_hours,
+                intensity_kind="forecast",
+            )
+            ecotracker_interval = trace_intervals[ecotracker_offset]
+            ecotracker_result = summarize_emissions(
+                job_energy_kwh,
+                submission_interval.actual_intensity_gco2eq_per_kwh,
+                ecotracker_interval.actual_intensity_gco2eq_per_kwh,
             )
 
-            carbon_aware_energy_kwh = float(telemetry_record["energy_kwh"])
-            carbon_aware_summary = summarize_emissions(
-                carbon_aware_energy_kwh,
-                baseline_actual_intensity,
-                actual_intensity_at_run,
+            oracle_plan, oracle_offset = build_trace_schedule_plan(
+                trace_intervals,
+                submission_offset,
+                args.max_delay_hours,
+                intensity_kind="actual",
+            )
+            oracle_interval = trace_intervals[oracle_offset]
+            oracle_result = summarize_emissions(
+                job_energy_kwh,
+                submission_interval.actual_intensity_gco2eq_per_kwh,
+                oracle_interval.actual_intensity_gco2eq_per_kwh,
             )
 
-            saved_pct = (
-                (carbon_aware_summary.saved_gco2eq / baseline_summary.actual_gco2eq) * 100.0
-                if baseline_summary.actual_gco2eq > 0
-                else 0.0
+            ecotracker_outcome = compare_values(
+                baseline_result.actual_gco2eq,
+                ecotracker_result.actual_gco2eq,
+            )
+            oracle_outcome = compare_values(
+                baseline_result.actual_gco2eq,
+                oracle_result.actual_gco2eq,
+            )
+            oracle_capture_ratio = summarize_capture_ratio(
+                ecotracker_result.saved_gco2eq,
+                oracle_result.saved_gco2eq,
             )
 
-            results.append(
+            day_key = format_iso_date(trace_day.day)
+            accumulator = daily_accumulators[day_key]
+            accumulator["baseline_total"] += baseline_result.actual_gco2eq
+            accumulator["ecotracker_total"] += ecotracker_result.actual_gco2eq
+            accumulator["oracle_total"] += oracle_result.actual_gco2eq
+            accumulator["ecotracker_delay_hours"].append(
+                ecotracker_plan.execution_delay_seconds / 3600.0
+            )
+            accumulator["oracle_delay_hours"].append(oracle_plan.execution_delay_seconds / 3600.0)
+            accumulator["scenario_count"] += 1
+            accumulator[f"ecotracker_{ecotracker_outcome}"] += 1
+
+            scenario_rows.append(
                 {
                     "scenario": scenario_index,
-                    "start_offset": start_offset,
-                    "submission_time": submission_time.isoformat(),
-                    "scheduled_time": scheduled_time.isoformat(),
+                    "day_index": day_index,
+                    "day": day_key,
+                    "submission_slot": submission_slot,
+                    "absolute_submission_offset": submission_offset,
+                    "submission_time": submission_interval.starts_at.isoformat(),
+                    "baseline_execution_time": submission_interval.starts_at.isoformat(),
+                    "ecotracker_execution_time": ecotracker_interval.starts_at.isoformat(),
+                    "oracle_execution_time": oracle_interval.starts_at.isoformat(),
                     "call_count": args.call_count,
-                    "energy_kwh": round(carbon_aware_energy_kwh, 10),
-                    "baseline_forecast_intensity": float(
-                        telemetry_record["schedule_plan"]["baseline_intensity_gco2eq_per_kwh"]
+                    "energy_kwh": round(job_energy_kwh, 10),
+                    "baseline_forecast_intensity": submission_interval.forecast_intensity_gco2eq_per_kwh,
+                    "baseline_actual_intensity": submission_interval.actual_intensity_gco2eq_per_kwh,
+                    "ecotracker_selected_forecast_intensity": ecotracker_plan.optimal_intensity_gco2eq_per_kwh,
+                    "ecotracker_actual_intensity_at_run": ecotracker_interval.actual_intensity_gco2eq_per_kwh,
+                    "oracle_selected_actual_intensity": oracle_interval.actual_intensity_gco2eq_per_kwh,
+                    "ecotracker_delay_h": round(ecotracker_plan.execution_delay_seconds / 3600.0, 4),
+                    "oracle_delay_h": round(oracle_plan.execution_delay_seconds / 3600.0, 4),
+                    "baseline_actual_gco2eq": round(baseline_result.actual_gco2eq, 8),
+                    "ecotracker_actual_gco2eq": round(ecotracker_result.actual_gco2eq, 8),
+                    "oracle_actual_gco2eq": round(oracle_result.actual_gco2eq, 8),
+                    "ecotracker_saved_gco2eq": round(ecotracker_result.saved_gco2eq, 8),
+                    "oracle_saved_gco2eq": round(oracle_result.saved_gco2eq, 8),
+                    "ecotracker_saved_pct": round(
+                        (ecotracker_result.saved_gco2eq / baseline_result.actual_gco2eq) * 100.0
+                        if baseline_result.actual_gco2eq > 0
+                        else 0.0,
+                        6,
                     ),
-                    "optimal_forecast_intensity": float(
-                        telemetry_record["schedule_plan"]["optimal_intensity_gco2eq_per_kwh"]
+                    "oracle_saved_pct": round(
+                        (oracle_result.saved_gco2eq / baseline_result.actual_gco2eq) * 100.0
+                        if baseline_result.actual_gco2eq > 0
+                        else 0.0,
+                        6,
                     ),
-                    "baseline_actual_intensity": baseline_actual_intensity,
-                    "actual_intensity_at_run": actual_intensity_at_run,
-                    "scheduled_delay_h": round(delay_seconds / 3600.0, 4),
-                    "baseline_actual_gco2eq": round(baseline_summary.actual_gco2eq, 8),
-                    "carbon_aware_actual_gco2eq": round(carbon_aware_summary.actual_gco2eq, 8),
-                    "saved_gco2eq": round(carbon_aware_summary.saved_gco2eq, 8),
-                    "saved_pct": round(saved_pct, 6),
+                    "oracle_capture_ratio": (
+                        round(oracle_capture_ratio, 6) if oracle_capture_ratio is not None else ""
+                    ),
+                    "ecotracker_outcome": ecotracker_outcome,
+                    "oracle_outcome": oracle_outcome,
                 }
             )
 
-    write_results(args.results_csv, results)
-    print_summary(
-        results,
-        results_csv=args.results_csv,
-        telemetry_path=telemetry_path,
-        call_count=args.call_count,
-        max_delay_hours=args.max_delay_hours,
-        fast_forwarded=not args.real_sleep,
-        jitter_enabled=args.keep_jitter,
+    daily_rows: list[dict[str, Any]] = []
+    for day_key in sorted(daily_accumulators):
+        accumulator = daily_accumulators[day_key]
+        baseline_total = accumulator["baseline_total"]
+        ecotracker_total = accumulator["ecotracker_total"]
+        oracle_total = accumulator["oracle_total"]
+        ecotracker_saved_gco2eq = baseline_total - ecotracker_total
+        oracle_saved_gco2eq = baseline_total - oracle_total
+        ecotracker_saved_pct = (ecotracker_saved_gco2eq / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+        oracle_saved_pct = (oracle_saved_gco2eq / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+        daily_capture_ratio = summarize_capture_ratio(ecotracker_saved_gco2eq, oracle_saved_gco2eq)
+
+        daily_rows.append(
+            {
+                "day": day_key,
+                "scenario_count": accumulator["scenario_count"],
+                "baseline_total_gco2eq": round(baseline_total, 8),
+                "ecotracker_total_gco2eq": round(ecotracker_total, 8),
+                "oracle_total_gco2eq": round(oracle_total, 8),
+                "ecotracker_saved_gco2eq": round(ecotracker_saved_gco2eq, 8),
+                "oracle_saved_gco2eq": round(oracle_saved_gco2eq, 8),
+                "ecotracker_saved_pct": round(ecotracker_saved_pct, 6),
+                "oracle_saved_pct": round(oracle_saved_pct, 6),
+                "oracle_capture_ratio": (
+                    round(daily_capture_ratio, 6) if daily_capture_ratio is not None else ""
+                ),
+                "mean_ecotracker_delay_h": round(statistics.mean(accumulator["ecotracker_delay_hours"]), 6),
+                "median_ecotracker_delay_h": round(statistics.median(accumulator["ecotracker_delay_hours"]), 6),
+                "mean_oracle_delay_h": round(statistics.mean(accumulator["oracle_delay_hours"]), 6),
+                "ecotracker_improved_scenarios": accumulator["ecotracker_improved"],
+                "ecotracker_tied_scenarios": accumulator["ecotracker_tied"],
+                "ecotracker_worse_scenarios": accumulator["ecotracker_worse"],
+                "ecotracker_day_outcome": compare_values(baseline_total, ecotracker_total),
+                "oracle_day_outcome": compare_values(baseline_total, oracle_total),
+            }
+        )
+
+    write_rows(args.scenario_results_csv, scenario_rows)
+    write_rows(args.daily_summary_csv, daily_rows)
+
+    summary = build_summary_payload(
+        scenario_rows,
+        daily_rows,
+        scenario_results_csv=args.scenario_results_csv,
+        daily_summary_csv=args.daily_summary_csv,
     )
+    summary.update(
+        {
+            "job_energy_kwh": job_energy_kwh,
+            "call_count": args.call_count,
+            "energy_per_call_kwh": args.energy_per_call_kwh,
+            "max_delay_hours": args.max_delay_hours,
+            "source_csv": str(args.csv_path),
+            "start_day": format_iso_date(start_day) if start_day else None,
+            "end_day": format_iso_date(end_day) if end_day else None,
+        }
+    )
+    write_json(args.summary_json, summary)
+    print_summary(summary, max_delay_hours=args.max_delay_hours, job_energy_kwh=job_energy_kwh)
 
 
 if __name__ == "__main__":
-    asyncio.run(run_benchmark())
+    run_benchmark()

@@ -10,6 +10,7 @@ from unittest.mock import patch
 
 import httpx
 from openai import AsyncOpenAI
+from openai.resources.chat.completions import AsyncCompletions, Completions
 
 BASE_DIR = Path(__file__).resolve().parents[1]
 if str(BASE_DIR) not in sys.path:
@@ -164,6 +165,21 @@ def write_summary(summary_path: Path, summary: dict[str, object]) -> None:
         json.dump(summary, handle, indent=2)
 
 
+def snapshot_openai_create_methods() -> dict[str, object | None]:
+    return {
+        "sync_create": Completions.__dict__.get("create"),
+        "async_create": AsyncCompletions.__dict__.get("create"),
+    }
+
+
+def methods_restored(snapshot: dict[str, object | None]) -> bool:
+    current = snapshot_openai_create_methods()
+    return (
+        current["sync_create"] is snapshot["sync_create"]
+        and current["async_create"] is snapshot["async_create"]
+    )
+
+
 def print_summary(summary: dict[str, object]) -> None:
     print("=" * 72)
     print("OPENAI END-TO-END INTEGRATION BENCHMARK")
@@ -173,6 +189,9 @@ def print_summary(summary: dict[str, object]) -> None:
     print(f"Model:                   {summary['model']}")
     print(f"Calls in session:        {summary['call_count']}")
     print(f"Telemetry captured:      {summary['telemetry_captured']}")
+    print(f"Telemetry file created:  {summary['telemetry_file_created']}")
+    print(f"Model usage captured:    {summary['model_usage_captured']}")
+    print(f"SDK restored:            {summary['sdk_methods_restored']}")
     print(f"Baseline energy:         {summary['baseline_energy_kwh']:.10f} kWh")
     print(f"Carbon-aware energy:     {summary['carbon_aware_energy_kwh']:.10f} kWh")
     print(f"Baseline actual:         {summary['baseline_actual_gco2eq']:.8f} gCO2eq")
@@ -198,6 +217,8 @@ async def run_benchmark() -> None:
         prompt_tokens=args.prompt_tokens,
         completion_tokens=args.completion_tokens,
     )
+    raw_methods = snapshot_openai_create_methods()
+    stabilized_methods: dict[str, object | None] | None = None
     carbon_aware_job = build_carbon_aware_job(
         provider,
         telemetry_sink,
@@ -207,6 +228,8 @@ async def run_benchmark() -> None:
     )
 
     telemetry_count = 0
+    baseline_stabilized = False
+    carbon_aware_restored = False
 
     try:
         with ExitStack() as stack:
@@ -235,6 +258,8 @@ async def run_benchmark() -> None:
                 model=args.model,
                 call_count=args.call_count,
             )
+            stabilized_methods = snapshot_openai_create_methods()
+            baseline_stabilized = True
             baseline_summary = summarize_emissions(
                 baseline_energy_kwh,
                 baseline_actual_intensity,
@@ -246,6 +271,13 @@ async def run_benchmark() -> None:
                 telemetry_path,
                 telemetry_count,
             )
+            if stabilized_methods is None:
+                raise RuntimeError("The benchmark did not capture a stabilized SDK baseline.")
+            carbon_aware_restored = methods_restored(stabilized_methods)
+            if not carbon_aware_restored:
+                raise RuntimeError(
+                    "OpenAI SDK methods were not restored to the stabilized post-initialization state."
+                )
 
         delay_seconds = float(telemetry_record["schedule_plan"]["execution_delay_seconds"])
         scheduled_time = submission_time + timedelta(seconds=delay_seconds)
@@ -256,6 +288,16 @@ async def run_benchmark() -> None:
         )
 
         carbon_aware_energy_kwh = float(telemetry_record["energy_kwh"])
+        telemetry_file_created = telemetry_path.exists()
+        model_usage_captured = bool(telemetry_record.get("model_usage"))
+        energy_captured = carbon_aware_energy_kwh > 0.0
+        if not telemetry_file_created:
+            raise RuntimeError("The integration benchmark did not create the telemetry JSONL file.")
+        if not energy_captured:
+            raise RuntimeError("The integration benchmark captured zero energy for the mocked OpenAI call.")
+        if not model_usage_captured:
+            raise RuntimeError("The integration benchmark did not record model usage metadata.")
+
         carbon_aware_summary = summarize_emissions(
             carbon_aware_energy_kwh,
             baseline_actual_intensity,
@@ -272,9 +314,14 @@ async def run_benchmark() -> None:
             "scheduled_time": scheduled_time.isoformat(),
             "model": args.model,
             "call_count": args.call_count,
-            "telemetry_captured": bool(
-                carbon_aware_energy_kwh > 0 and telemetry_record.get("model_usage")
-            ),
+            "telemetry_captured": bool(energy_captured and model_usage_captured),
+            "telemetry_file_created": telemetry_file_created,
+            "model_usage_captured": model_usage_captured,
+            "sdk_methods_restored": bool(baseline_stabilized and carbon_aware_restored),
+            "baseline_session_stabilized": baseline_stabilized,
+            "carbon_aware_session_restored": carbon_aware_restored,
+            "ecologits_initialization_changed_sdk": not methods_restored(raw_methods),
+            "telemetry_record_count": telemetry_count,
             "baseline_energy_kwh": baseline_energy_kwh,
             "carbon_aware_energy_kwh": carbon_aware_energy_kwh,
             "baseline_actual_intensity": baseline_actual_intensity,

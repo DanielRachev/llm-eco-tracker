@@ -219,9 +219,13 @@ __marimo__/
 eco_telemetry.jsonl
 
 # Experiment results
-experiment_results.csv
-trace_benchmark_results.csv
-trace_benchmark_telemetry.jsonl
+scenario_results.csv
+daily_summary.csv
+benchmark_summary.json
+benchmark_analysis.json
+benchmark_analysis.md
 openai_integration_summary.json
 openai_integration_telemetry.jsonl
+overhead_benchmark_runs.csv
+overhead_benchmark_summary.json
 paper_figures/

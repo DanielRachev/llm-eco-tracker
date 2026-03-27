@@ -148,39 +148,98 @@ The report command auto-detects JSONL versus logger-backed inputs by default and
 - Total gCO2eq saved by EcoTracker
 - A car-travel equivalence based on emitted gCO2eq
 
-### Fixture Data
+### Trace Data
 
-The repository includes a CSV fixture at `tests/fixtures/mock_forecast.csv`.
-To refresh it from the UK Carbon Intensity API, run:
+The repository keeps two CSV datasets:
+
+- `tests/fixtures/mock_forecast.csv`
+  A small deterministic fixture used by tests and the integration benchmark.
+- `tests/fixtures/benchmark_trace.csv`
+  A multi-day historical trace for the scheduler benchmark and paper figures.
+
+To refresh the benchmark trace from the UK Carbon Intensity API, run:
 
 ```bash
 python scripts/download_mock_data.py
 ```
 
+The downloader defaults to a fixed 30-day historical window for reproducibility,
+but you can override it:
+
+```bash
+python scripts/download_mock_data.py --start-day 2026-02-14 --end-day 2026-03-15
+python scripts/download_mock_data.py --last-n-days 30 --output-path tests/fixtures/benchmark_trace.csv
+```
+
 ### Benchmark Scripts
 
-The repository includes two benchmark scripts for evaluation:
+The repository now includes three evaluation scripts plus one analysis script:
 
 - `python scripts/run_benchmark.py`
-  Runs the trace-driven scheduler benchmark. By default it sweeps 48 submission
-  times from `tests/fixtures/mock_forecast.csv`, fast-forwards waiting, disables
-  scheduler jitter for reproducibility, and writes:
-  - `trace_benchmark_results.csv`
-  - `trace_benchmark_telemetry.jsonl`
+  Runs the multi-day trace-driven scheduler benchmark. For every eligible day
+  in `tests/fixtures/benchmark_trace.csv`, it sweeps all 48 submission slots and
+  evaluates three policies:
+  - `Baseline`: immediate execution scored with actual grid intensity
+  - `EcoTracker`: forecast-driven scheduling scored with actual grid intensity
+  - `Oracle`: perfect-information scheduling scored with actual grid intensity
+
+  It writes:
+  - `scenario_results.csv`
+  - `daily_summary.csv`
+  - `benchmark_summary.json`
+
+- `python scripts/analyze_benchmark_results.py`
+  Performs the paper-facing statistics on the day-level benchmark output. It
+  computes aggregate reductions, descriptive statistics, a bootstrap confidence
+  interval for the mean daily reduction, and a paired Wilcoxon signed-rank test.
+
+  It writes:
+  - `benchmark_analysis.json`
+  - `benchmark_analysis.md`
 
 - `python scripts/run_openai_integration_benchmark.py`
   Runs an end-to-end OpenAI SDK benchmark using `AsyncOpenAI` with an
   `httpx.MockTransport`, so the request path is real but no paid API call is
-  made. It writes:
+  made. It verifies that telemetry is captured, model usage is written, energy
+  is non-zero, and the SDK monkey-patch is restored after the session.
+
+  It writes:
   - `openai_integration_telemetry.jsonl`
   - `openai_integration_summary.json`
 
+- `python scripts/run_overhead_benchmark.py`
+  Measures the decorator's developer-facing overhead with `max_delay_hours=0`
+  by comparing repeated batches of undecorated and decorated function calls.
+
+  It writes:
+  - `overhead_benchmark_runs.csv`
+  - `overhead_benchmark_summary.json`
+
 - `python scripts/generate_paper_figures.py`
-  Reads `trace_benchmark_results.csv` plus the mock forecast CSV and renders
-  paper-ready figures into `paper_figures/` as both PNG and PDF:
+  Reads `scenario_results.csv`, `daily_summary.csv`, and the benchmark trace CSV
+  and renders paper-ready figures into `paper_figures/` as both PNG and PDF:
   - `figure_1_curve`
   - `figure_2_total_emissions`
-  - `figure_3_emissions_profile`
+  - `figure_3_daily_reductions`
+
+### Recommended Evaluation Workflow
+
+Run the benchmark suite in this order:
+
+```bash
+python scripts/run_benchmark.py
+python scripts/analyze_benchmark_results.py
+python scripts/run_openai_integration_benchmark.py
+python scripts/run_overhead_benchmark.py
+python scripts/generate_paper_figures.py
+```
+
+This corresponds to the intended methodology:
+
+- multi-day trace benchmark for scheduler effectiveness
+- day-level statistical analysis
+- end-to-end integration validation for the real OpenAI interception path
+- lightweight overhead measurement for developer experience
 
 ## License
 

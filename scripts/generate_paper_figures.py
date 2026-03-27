@@ -1,9 +1,11 @@
 import argparse
 import csv
 import json
+import random
+import statistics
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parents[1]
@@ -20,38 +22,52 @@ except ImportError as exc:
     ) from exc
 
 
-DEFAULT_RESULTS_CSV = BASE_DIR / "trace_benchmark_results.csv"
-DEFAULT_FORECAST_CSV = BASE_DIR / "tests" / "fixtures" / "mock_forecast.csv"
+DEFAULT_SCENARIO_RESULTS_CSV = BASE_DIR / "scenario_results.csv"
+DEFAULT_DAILY_SUMMARY_CSV = BASE_DIR / "daily_summary.csv"
+DEFAULT_FORECAST_CSV = BASE_DIR / "tests" / "fixtures" / "benchmark_trace.csv"
 DEFAULT_OUTPUT_DIR = BASE_DIR / "paper_figures"
 DEFAULT_FORMATS = ("png", "pdf")
 DEFAULT_DPI = 300
-DEFAULT_CURVE_HOURS = 24
 
-COLOR_GRID = "#0072B2"
+COLOR_GRID = "#4D4D4D"
 COLOR_BASELINE = "#D55E00"
-COLOR_AWARE = "#009E73"
+COLOR_ECOTRACKER = "#009E73"
+COLOR_ORACLE = "#0072B2"
 COLOR_FILL = "#56B4E9"
-COLOR_NEUTRAL = "#4D4D4D"
 COLOR_GRIDLINES = "#D9D9D9"
 
 
 @dataclass(frozen=True, slots=True)
-class BenchmarkRow:
-    scenario: int
-    start_offset: int
+class ScenarioRow:
+    day: date
+    submission_slot: int
     submission_time: datetime
-    scheduled_time: datetime
-    call_count: int
-    energy_kwh: float
-    baseline_forecast_intensity: float
-    optimal_forecast_intensity: float
+    baseline_execution_time: datetime
+    ecotracker_execution_time: datetime
+    oracle_execution_time: datetime
     baseline_actual_intensity: float
-    actual_intensity_at_run: float
-    scheduled_delay_h: float
+    ecotracker_actual_intensity_at_run: float
+    oracle_actual_intensity_at_run: float
     baseline_actual_gco2eq: float
-    carbon_aware_actual_gco2eq: float
-    saved_gco2eq: float
-    saved_pct: float
+    ecotracker_actual_gco2eq: float
+    oracle_actual_gco2eq: float
+    ecotracker_delay_h: float
+    oracle_delay_h: float
+    ecotracker_saved_pct: float
+    oracle_saved_pct: float
+    ecotracker_outcome: str
+
+
+@dataclass(frozen=True, slots=True)
+class DailyRow:
+    day: date
+    baseline_total_gco2eq: float
+    ecotracker_total_gco2eq: float
+    oracle_total_gco2eq: float
+    ecotracker_saved_pct: float
+    oracle_saved_pct: float
+    oracle_capture_ratio: float | None
+    mean_ecotracker_delay_h: float
 
 
 @dataclass(frozen=True, slots=True)
@@ -64,16 +80,22 @@ class ForecastPoint:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Generate paper-ready benchmark figures")
-    parser.add_argument("--results-csv", type=Path, default=DEFAULT_RESULTS_CSV)
+    parser.add_argument("--scenario-results-csv", type=Path, default=DEFAULT_SCENARIO_RESULTS_CSV)
+    parser.add_argument("--daily-summary-csv", type=Path, default=DEFAULT_DAILY_SUMMARY_CSV)
     parser.add_argument("--forecast-csv", type=Path, default=DEFAULT_FORECAST_CSV)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
     parser.add_argument("--dpi", type=int, default=DEFAULT_DPI)
-    parser.add_argument("--curve-hours", type=int, default=DEFAULT_CURVE_HOURS)
+    parser.add_argument(
+        "--curve-day",
+        type=str,
+        default=None,
+        help="Representative UTC day to plot in Figure 1, for example 2026-03-01.",
+    )
     parser.add_argument(
         "--curve-point-mode",
         choices=("shifted-only", "all"),
         default="shifted-only",
-        help="Which benchmark scenarios to overlay on the intensity curve.",
+        help="Whether to overlay only shifted submissions or all submissions in Figure 1.",
     )
     parser.add_argument(
         "--formats",
@@ -111,7 +133,7 @@ def ensure_inputs_exist(*paths: Path) -> None:
         joined = ", ".join(missing)
         raise SystemExit(
             f"Missing required input file(s): {joined}. "
-            "Run the benchmark first if the results CSV has not been generated yet."
+            "Run the benchmark and analysis scripts first."
         )
 
 
@@ -121,31 +143,58 @@ def parse_timestamp(value: str) -> datetime:
     return datetime.fromisoformat(value)
 
 
-def load_benchmark_rows(path: Path) -> list[BenchmarkRow]:
+def load_scenario_rows(path: Path) -> list[ScenarioRow]:
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         rows = [
-            BenchmarkRow(
-                scenario=int(row["scenario"]),
-                start_offset=int(row["start_offset"]),
+            ScenarioRow(
+                day=date.fromisoformat(row["day"]),
+                submission_slot=int(row["submission_slot"]),
                 submission_time=parse_timestamp(row["submission_time"]),
-                scheduled_time=parse_timestamp(row["scheduled_time"]),
-                call_count=int(row["call_count"]),
-                energy_kwh=float(row["energy_kwh"]),
-                baseline_forecast_intensity=float(row["baseline_forecast_intensity"]),
-                optimal_forecast_intensity=float(row["optimal_forecast_intensity"]),
+                baseline_execution_time=parse_timestamp(row["baseline_execution_time"]),
+                ecotracker_execution_time=parse_timestamp(row["ecotracker_execution_time"]),
+                oracle_execution_time=parse_timestamp(row["oracle_execution_time"]),
                 baseline_actual_intensity=float(row["baseline_actual_intensity"]),
-                actual_intensity_at_run=float(row["actual_intensity_at_run"]),
-                scheduled_delay_h=float(row["scheduled_delay_h"]),
+                ecotracker_actual_intensity_at_run=float(row["ecotracker_actual_intensity_at_run"]),
+                oracle_actual_intensity_at_run=float(row["oracle_selected_actual_intensity"]),
                 baseline_actual_gco2eq=float(row["baseline_actual_gco2eq"]),
-                carbon_aware_actual_gco2eq=float(row["carbon_aware_actual_gco2eq"]),
-                saved_gco2eq=float(row["saved_gco2eq"]),
-                saved_pct=float(row["saved_pct"]),
+                ecotracker_actual_gco2eq=float(row["ecotracker_actual_gco2eq"]),
+                oracle_actual_gco2eq=float(row["oracle_actual_gco2eq"]),
+                ecotracker_delay_h=float(row["ecotracker_delay_h"]),
+                oracle_delay_h=float(row["oracle_delay_h"]),
+                ecotracker_saved_pct=float(row["ecotracker_saved_pct"]),
+                oracle_saved_pct=float(row["oracle_saved_pct"]),
+                ecotracker_outcome=row["ecotracker_outcome"],
             )
             for row in reader
         ]
     if not rows:
-        raise SystemExit(f"No benchmark rows were found in '{path}'.")
+        raise SystemExit(f"No scenario rows were found in '{path}'.")
+    return rows
+
+
+def load_daily_rows(path: Path) -> list[DailyRow]:
+    with path.open(newline="", encoding="utf-8") as handle:
+        reader = csv.DictReader(handle)
+        rows = [
+            DailyRow(
+                day=date.fromisoformat(row["day"]),
+                baseline_total_gco2eq=float(row["baseline_total_gco2eq"]),
+                ecotracker_total_gco2eq=float(row["ecotracker_total_gco2eq"]),
+                oracle_total_gco2eq=float(row["oracle_total_gco2eq"]),
+                ecotracker_saved_pct=float(row["ecotracker_saved_pct"]),
+                oracle_saved_pct=float(row["oracle_saved_pct"]),
+                oracle_capture_ratio=(
+                    float(row["oracle_capture_ratio"])
+                    if row["oracle_capture_ratio"] not in {"", None}
+                    else None
+                ),
+                mean_ecotracker_delay_h=float(row["mean_ecotracker_delay_h"]),
+            )
+            for row in reader
+        ]
+    if not rows:
+        raise SystemExit(f"No daily summary rows were found in '{path}'.")
     return rows
 
 
@@ -178,17 +227,52 @@ def save_figure(fig, output_dir: Path, stem: str, formats: list[str], dpi: int) 
     return written_paths
 
 
-def build_curve_window(
-    rows: list[BenchmarkRow],
+def choose_curve_day(daily_rows: list[DailyRow], requested_day: str | None) -> date:
+    if requested_day is not None:
+        target_day = date.fromisoformat(requested_day)
+        if any(row.day == target_day for row in daily_rows):
+            return target_day
+        raise SystemExit(f"The requested curve day '{requested_day}' is not present in daily_summary.csv.")
+
+    sorted_rows = sorted(daily_rows, key=lambda row: row.ecotracker_saved_pct)
+    return sorted_rows[len(sorted_rows) // 2].day
+
+
+def apply_time_axis(ax, *, window_start: datetime, window_end: datetime) -> None:
+    locator = mdates.AutoDateLocator(minticks=6, maxticks=10)
+    formatter = mdates.ConciseDateFormatter(locator)
+    ax.xaxis.set_major_locator(locator)
+    ax.xaxis.set_major_formatter(formatter)
+    ax.set_xlim(window_start, window_end)
+
+
+def select_curve_rows(
+    scenario_rows: list[ScenarioRow],
+    curve_day: date,
     *,
-    requested_hours: int,
+    point_mode: str,
+) -> list[ScenarioRow]:
+    rows = [row for row in scenario_rows if row.day == curve_day]
+    if point_mode == "shifted-only":
+        shifted_rows = [row for row in rows if row.ecotracker_delay_h > 0]
+        if shifted_rows:
+            return shifted_rows
+    return rows
+
+
+def select_curve_window(
+    curve_day: date,
+    curve_rows: list[ScenarioRow],
 ) -> tuple[datetime, datetime]:
-    window_start = min(row.submission_time for row in rows)
-    submission_window_end = window_start + timedelta(hours=requested_hours)
-    final_execution_time = max(
-        max(row.submission_time, row.scheduled_time) for row in rows
+    window_start = datetime.combine(curve_day, time(0, 0), tzinfo=timezone.utc)
+    execution_end = max(
+        max(row.submission_time, row.ecotracker_execution_time) for row in curve_rows
     ) + timedelta(minutes=30)
-    return window_start, max(submission_window_end, final_execution_time)
+    window_end = max(
+        datetime.combine(curve_day + timedelta(days=1), time(0, 0), tzinfo=timezone.utc),
+        execution_end,
+    )
+    return window_start, window_end
 
 
 def filter_forecast_window(
@@ -207,50 +291,44 @@ def filter_forecast_window(
     return window_points
 
 
-def apply_time_axis(ax, *, window_start: datetime, window_end: datetime) -> None:
-    locator = mdates.AutoDateLocator(minticks=6, maxticks=10)
-    formatter = mdates.ConciseDateFormatter(locator)
-    ax.xaxis.set_major_locator(locator)
-    ax.xaxis.set_major_formatter(formatter)
-    ax.set_xlim(window_start, window_end)
-
-
-def plot_intensity_shift_curve(
-    rows: list[BenchmarkRow],
+def plot_representative_day_curve(
+    scenario_rows: list[ScenarioRow],
+    daily_rows: list[DailyRow],
     forecast_points: list[ForecastPoint],
     *,
+    curve_day: date,
+    point_mode: str,
     output_dir: Path,
     formats: list[str],
     dpi: int,
-    curve_hours: int,
-    point_mode: str,
 ) -> list[Path]:
-    plotted_rows = [row for row in rows if row.scheduled_delay_h > 0] if point_mode == "shifted-only" else rows
-    if not plotted_rows:
-        plotted_rows = rows
+    curve_rows = select_curve_rows(scenario_rows, curve_day, point_mode=point_mode)
+    if not curve_rows:
+        raise SystemExit(f"No scenario rows were available for representative day {curve_day.isoformat()}.")
 
-    window_start, window_end = build_curve_window(rows, requested_hours=curve_hours)
+    window_start, window_end = select_curve_window(curve_day, curve_rows)
     window_points = filter_forecast_window(
         forecast_points,
         window_start=window_start,
         window_end=window_end,
     )
+    day_summary = next(row for row in daily_rows if row.day == curve_day)
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.6), constrained_layout=True)
+    fig, ax = plt.subplots(figsize=(10.8, 5.8), constrained_layout=True)
     ax.plot(
         [point.starts_at for point in window_points],
         [point.actual_intensity for point in window_points],
         color=COLOR_GRID,
-        linewidth=2.4,
+        linewidth=2.3,
         label="Grid carbon intensity (actual)",
         zorder=2,
     )
     ax.scatter(
-        [row.submission_time for row in plotted_rows],
-        [row.baseline_actual_intensity for row in plotted_rows],
+        [row.baseline_execution_time for row in curve_rows],
+        [row.baseline_actual_intensity for row in curve_rows],
         color=COLOR_BASELINE,
         marker="o",
-        s=52,
+        s=48,
         alpha=0.88,
         edgecolors="white",
         linewidths=0.5,
@@ -258,27 +336,28 @@ def plot_intensity_shift_curve(
         zorder=4,
     )
     ax.scatter(
-        [row.scheduled_time for row in plotted_rows],
-        [row.actual_intensity_at_run for row in plotted_rows],
-        color=COLOR_AWARE,
+        [row.ecotracker_execution_time for row in curve_rows],
+        [row.ecotracker_actual_intensity_at_run for row in curve_rows],
+        color=COLOR_ECOTRACKER,
         marker="^",
-        s=68,
+        s=62,
         alpha=0.9,
         edgecolors="white",
         linewidths=0.5,
-        label="Carbon-aware execution",
+        label="EcoTracker execution",
         zorder=5,
     )
 
     apply_time_axis(ax, window_start=window_start, window_end=window_end)
-    ax.set_title("Figure 1. Grid Carbon Intensity and Carbon-Aware Temporal Shifting")
+    ax.set_title("Figure 1. Representative-Day Grid Intensity and Temporal Shifting")
     ax.set_xlabel("Execution time")
     ax.set_ylabel("Carbon intensity (gCO2eq/kWh)")
-    ax.legend(loc="upper left", ncol=1)
+    ax.legend(loc="upper left")
 
     summary_text = (
-        f"Shifted scenarios: {sum(1 for row in rows if row.scheduled_delay_h > 0)} / {len(rows)}\n"
-        f"Average delay: {sum(row.scheduled_delay_h for row in rows) / len(rows):.2f} h"
+        f"Representative day: {curve_day.isoformat()}\n"
+        f"Daily reduction: {day_summary.ecotracker_saved_pct:.2f}%\n"
+        f"Mean delay: {day_summary.mean_ecotracker_delay_h:.2f} h"
     )
     ax.text(
         0.99,
@@ -288,150 +367,158 @@ def plot_intensity_shift_curve(
         ha="right",
         va="bottom",
         fontsize=10,
-        color=COLOR_NEUTRAL,
-        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.4"},
+        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"},
     )
 
     return save_figure(fig, output_dir, "figure_1_curve", formats, dpi)
 
 
 def plot_total_emissions_bar(
-    rows: list[BenchmarkRow],
+    daily_rows: list[DailyRow],
     *,
     output_dir: Path,
     formats: list[str],
     dpi: int,
 ) -> list[Path]:
-    baseline_total = sum(row.baseline_actual_gco2eq for row in rows)
-    carbon_aware_total = sum(row.carbon_aware_actual_gco2eq for row in rows)
-    reduction_pct = (
-        ((baseline_total - carbon_aware_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+    baseline_total = sum(row.baseline_total_gco2eq for row in daily_rows)
+    ecotracker_total = sum(row.ecotracker_total_gco2eq for row in daily_rows)
+    oracle_total = sum(row.oracle_total_gco2eq for row in daily_rows)
+    ecotracker_reduction_pct = (
+        ((baseline_total - ecotracker_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+    )
+    oracle_reduction_pct = (
+        ((baseline_total - oracle_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
     )
 
-    fig, ax = plt.subplots(figsize=(7.6, 5.6), constrained_layout=True)
-    labels = ["Baseline", "Carbon-aware"]
-    values = [baseline_total, carbon_aware_total]
-    colors = [COLOR_BASELINE, COLOR_AWARE]
+    fig, ax = plt.subplots(figsize=(8.2, 5.8), constrained_layout=True)
+    labels = ["Baseline", "EcoTracker", "Oracle"]
+    values = [baseline_total, ecotracker_total, oracle_total]
+    colors = [COLOR_BASELINE, COLOR_ECOTRACKER, COLOR_ORACLE]
     bars = ax.bar(labels, values, color=colors, width=0.58, zorder=3)
 
     for bar, value in zip(bars, values):
         ax.text(
             bar.get_x() + bar.get_width() / 2.0,
             bar.get_height() + max(values) * 0.02,
-            f"{value:.3f}",
+            f"{value:.2f}",
             ha="center",
             va="bottom",
             fontsize=11,
-            color=COLOR_NEUTRAL,
         )
 
-    ax.set_title("Figure 2. Total Emissions Across the Benchmark Sweep")
+    ax.set_title("Figure 2. Aggregate Emissions Across the Multi-Day Benchmark")
     ax.set_ylabel("Total emitted carbon (gCO2eq)")
     ax.set_axisbelow(True)
     ax.text(
         0.98,
         0.95,
-        f"Reduction: {reduction_pct:.2f}%",
+        (
+            f"EcoTracker reduction: {ecotracker_reduction_pct:.2f}%\n"
+            f"Oracle reduction: {oracle_reduction_pct:.2f}%"
+        ),
         transform=ax.transAxes,
         ha="right",
         va="top",
-        fontsize=11,
-        color=COLOR_NEUTRAL,
+        fontsize=10,
         bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"},
     )
 
     return save_figure(fig, output_dir, "figure_2_total_emissions", formats, dpi)
 
 
-def plot_emissions_profile(
-    rows: list[BenchmarkRow],
+def plot_daily_reduction_distribution(
+    daily_rows: list[DailyRow],
     *,
     output_dir: Path,
     formats: list[str],
     dpi: int,
 ) -> list[Path]:
-    sorted_rows = sorted(rows, key=lambda row: row.submission_time)
-    x_values = [row.submission_time for row in sorted_rows]
-    baseline_values = [row.baseline_actual_gco2eq for row in sorted_rows]
-    aware_values = [row.carbon_aware_actual_gco2eq for row in sorted_rows]
+    ecotracker_reductions = [row.ecotracker_saved_pct for row in daily_rows]
+    oracle_reductions = [row.oracle_saved_pct for row in daily_rows]
 
-    fig, ax = plt.subplots(figsize=(10.5, 5.6), constrained_layout=True)
-    ax.plot(
-        x_values,
-        baseline_values,
-        color=COLOR_BASELINE,
-        linewidth=2.1,
-        marker="o",
-        markersize=4,
-        label="Baseline",
-        zorder=4,
+    fig, ax = plt.subplots(figsize=(8.6, 5.8), constrained_layout=True)
+    boxplot = ax.boxplot(
+        [ecotracker_reductions, oracle_reductions],
+        tick_labels=["EcoTracker", "Oracle"],
+        patch_artist=True,
+        widths=0.55,
+        medianprops={"color": "black", "linewidth": 1.2},
     )
-    ax.plot(
-        x_values,
-        aware_values,
-        color=COLOR_AWARE,
-        linewidth=2.1,
-        marker="^",
-        markersize=4,
-        label="Carbon-aware",
-        zorder=5,
-    )
-    ax.fill_between(
-        x_values,
-        aware_values,
-        baseline_values,
-        where=[baseline >= aware for baseline, aware in zip(baseline_values, aware_values)],
-        color=COLOR_FILL,
-        alpha=0.18,
-        interpolate=True,
-        label="Realized savings",
-        zorder=2,
-    )
+    for patch, color in zip(boxplot["boxes"], [COLOR_ECOTRACKER, COLOR_ORACLE]):
+        patch.set_facecolor(color)
+        patch.set_alpha(0.35)
+        patch.set_edgecolor(color)
+        patch.set_linewidth(1.4)
+    for whisker, color in zip(boxplot["whiskers"], [COLOR_ECOTRACKER, COLOR_ECOTRACKER, COLOR_ORACLE, COLOR_ORACLE]):
+        whisker.set_color(color)
+        whisker.set_linewidth(1.2)
+    for cap, color in zip(boxplot["caps"], [COLOR_ECOTRACKER, COLOR_ECOTRACKER, COLOR_ORACLE, COLOR_ORACLE]):
+        cap.set_color(color)
+        cap.set_linewidth(1.2)
 
-    apply_time_axis(
-        ax,
-        window_start=min(x_values),
-        window_end=max(x_values) + timedelta(minutes=30),
-    )
-    ax.set_title("Figure 3. Scenario-Level Emissions Across Submission Times")
-    ax.set_xlabel("Submission time")
-    ax.set_ylabel("Emitted carbon per job (gCO2eq)")
-    ax.legend(loc="upper left", ncol=3)
+    rng = random.Random(1729)
+    for position, values, color in (
+        (1, ecotracker_reductions, COLOR_ECOTRACKER),
+        (2, oracle_reductions, COLOR_ORACLE),
+    ):
+        jitter = [position + rng.uniform(-0.08, 0.08) for _ in values]
+        ax.scatter(
+            jitter,
+            values,
+            color=color,
+            edgecolors="white",
+            linewidths=0.4,
+            s=36,
+            alpha=0.85,
+            zorder=4,
+        )
 
-    average_reduction_pct = sum(row.saved_pct for row in rows) / len(rows)
+    ax.set_title("Figure 3. Distribution of Daily Emissions Reductions")
+    ax.set_ylabel("Daily reduction relative to baseline (%)")
+    ax.set_axisbelow(True)
     ax.text(
-        0.99,
+        0.98,
         0.03,
-        f"Average reduction: {average_reduction_pct:.2f}%",
+        (
+            f"EcoTracker mean: {statistics.mean(ecotracker_reductions):.2f}%\n"
+            f"EcoTracker median: {statistics.median(ecotracker_reductions):.2f}%\n"
+            f"Days: {len(daily_rows)}"
+        ),
         transform=ax.transAxes,
         ha="right",
         va="bottom",
         fontsize=10,
-        color=COLOR_NEUTRAL,
         bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"},
     )
 
-    return save_figure(fig, output_dir, "figure_3_emissions_profile", formats, dpi)
+    return save_figure(fig, output_dir, "figure_3_daily_reductions", formats, dpi)
 
 
 def build_manifest(
-    rows: list[BenchmarkRow],
+    daily_rows: list[DailyRow],
     written_paths: list[Path],
     *,
     output_dir: Path,
+    curve_day: date,
 ) -> Path:
-    baseline_total = sum(row.baseline_actual_gco2eq for row in rows)
-    carbon_aware_total = sum(row.carbon_aware_actual_gco2eq for row in rows)
+    baseline_total = sum(row.baseline_total_gco2eq for row in daily_rows)
+    ecotracker_total = sum(row.ecotracker_total_gco2eq for row in daily_rows)
+    oracle_total = sum(row.oracle_total_gco2eq for row in daily_rows)
     manifest = {
-        "scenario_count": len(rows),
-        "shifted_scenarios": sum(1 for row in rows if row.scheduled_delay_h > 0),
-        "average_delay_h": sum(row.scheduled_delay_h for row in rows) / len(rows),
-        "average_reduction_pct": sum(row.saved_pct for row in rows) / len(rows),
-        "weighted_total_reduction_pct": (
-            ((baseline_total - carbon_aware_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+        "day_count": len(daily_rows),
+        "curve_day": curve_day.isoformat(),
+        "aggregate_ecotracker_reduction_pct": (
+            ((baseline_total - ecotracker_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
         ),
-        "baseline_total_gco2eq": baseline_total,
-        "carbon_aware_total_gco2eq": carbon_aware_total,
+        "aggregate_oracle_reduction_pct": (
+            ((baseline_total - oracle_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
+        ),
+        "mean_daily_ecotracker_reduction_pct": statistics.mean(
+            [row.ecotracker_saved_pct for row in daily_rows]
+        ),
+        "median_daily_ecotracker_reduction_pct": statistics.median(
+            [row.ecotracker_saved_pct for row in daily_rows]
+        ),
         "written_files": [str(path) for path in written_paths],
     }
     manifest_path = output_dir / "figure_manifest.json"
@@ -443,40 +530,52 @@ def build_manifest(
 def main() -> None:
     args = parse_args()
     configure_matplotlib()
-    ensure_inputs_exist(args.results_csv, args.forecast_csv)
+    ensure_inputs_exist(
+        args.scenario_results_csv,
+        args.daily_summary_csv,
+        args.forecast_csv,
+    )
 
-    rows = load_benchmark_rows(args.results_csv)
+    scenario_rows = load_scenario_rows(args.scenario_results_csv)
+    daily_rows = load_daily_rows(args.daily_summary_csv)
     forecast_points = load_forecast_points(args.forecast_csv)
+    curve_day = choose_curve_day(daily_rows, args.curve_day)
 
     written_paths: list[Path] = []
     written_paths.extend(
-        plot_intensity_shift_curve(
-            rows,
+        plot_representative_day_curve(
+            scenario_rows,
+            daily_rows,
             forecast_points,
+            curve_day=curve_day,
+            point_mode=args.curve_point_mode,
             output_dir=args.output_dir,
             formats=args.formats,
             dpi=args.dpi,
-            curve_hours=args.curve_hours,
-            point_mode=args.curve_point_mode,
         )
     )
     written_paths.extend(
         plot_total_emissions_bar(
-            rows,
+            daily_rows,
             output_dir=args.output_dir,
             formats=args.formats,
             dpi=args.dpi,
         )
     )
     written_paths.extend(
-        plot_emissions_profile(
-            rows,
+        plot_daily_reduction_distribution(
+            daily_rows,
             output_dir=args.output_dir,
             formats=args.formats,
             dpi=args.dpi,
         )
     )
-    manifest_path = build_manifest(rows, written_paths, output_dir=args.output_dir)
+    manifest_path = build_manifest(
+        daily_rows,
+        written_paths,
+        output_dir=args.output_dir,
+        curve_day=curve_day,
+    )
 
     print("=" * 72)
     print("PAPER FIGURES GENERATED")

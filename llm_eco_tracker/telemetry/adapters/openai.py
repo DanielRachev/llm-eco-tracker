@@ -16,6 +16,8 @@ class OpenAIChatCompletionsAdapter:
     def __init__(self):
         self._original_sync_create = None
         self._original_async_create = None
+        self._original_sync_descriptor = None
+        self._original_async_descriptor = None
         self._sync_completions_cls = None
         self._async_completions_cls = None
         self._warned_missing_openai = False
@@ -27,23 +29,27 @@ class OpenAIChatCompletionsAdapter:
 
         self._sync_completions_cls = completions_cls
         self._async_completions_cls = async_completions_cls
+        self._original_sync_descriptor = completions_cls.__dict__.get("create")
         self._original_sync_create = completions_cls.create
         completions_cls.create = self._build_sync_tracker(session_hooks)
 
         if async_completions_cls is not None:
+            self._original_async_descriptor = async_completions_cls.__dict__.get("create")
             self._original_async_create = async_completions_cls.create
             async_completions_cls.create = self._build_async_tracker(session_hooks)
 
         return True
 
     def uninstall(self) -> None:
-        if self._sync_completions_cls is not None and self._original_sync_create is not None:
-            self._sync_completions_cls.create = self._original_sync_create
-        if self._async_completions_cls is not None and self._original_async_create is not None:
-            self._async_completions_cls.create = self._original_async_create
+        if self._sync_completions_cls is not None and self._original_sync_descriptor is not None:
+            self._sync_completions_cls.create = self._original_sync_descriptor
+        if self._async_completions_cls is not None and self._original_async_descriptor is not None:
+            self._async_completions_cls.create = self._original_async_descriptor
 
         self._original_sync_create = None
         self._original_async_create = None
+        self._original_sync_descriptor = None
+        self._original_async_descriptor = None
         self._sync_completions_cls = None
         self._async_completions_cls = None
 
