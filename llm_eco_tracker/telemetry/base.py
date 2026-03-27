@@ -12,6 +12,9 @@ class TelemetrySessionHooks(Protocol):
     def record_energy_kwh(self, energy_kwh: float) -> None:
         """Add energy captured for the current session."""
 
+    def record_llm_provider(self, provider_name: str) -> None:
+        """Record one LLM provider observed during the current session."""
+
     def record_model_usage(self, requested_model: str | None, effective_model: str | None) -> None:
         """Record one model invocation for the current session."""
 
@@ -21,6 +24,9 @@ class TelemetrySessionHooks(Protocol):
 
 class TelemetryAdapter(Protocol):
     provider_name: str
+
+    def is_available(self) -> bool:
+        """Return whether the provider SDK needed by this adapter is installed."""
 
     def install(self, session_hooks: TelemetrySessionHooks) -> bool:
         """Install provider-specific telemetry hooks for the current process."""

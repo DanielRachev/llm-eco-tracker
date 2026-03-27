@@ -16,14 +16,16 @@ from .planning import (
 from .providers import UKCarbonIntensityProvider
 from .providers.base import ForecastProvider
 from .telemetry import EcoLogitsRuntime, JsonlTelemetrySink
-from .telemetry.adapters import OpenAIChatCompletionsAdapter
+from .telemetry.adapters import AnthropicMessagesAdapter, OpenAIChatCompletionsAdapter
 from .telemetry.base import TelemetrySink
 
 
 logger = logging.getLogger(__name__)
 
 _telemetry_path = Path("eco_telemetry.jsonl")
-_default_telemetry_runtime = EcoLogitsRuntime([OpenAIChatCompletionsAdapter()])
+_default_telemetry_runtime = EcoLogitsRuntime(
+    [OpenAIChatCompletionsAdapter(), AnthropicMessagesAdapter()]
+)
 _default_telemetry_sink = JsonlTelemetrySink(_telemetry_path)
 
 
@@ -81,7 +83,8 @@ def carbon_aware(
 ):
     """
     Delay non-urgent work until a greener grid window, then record session-wide
-    energy telemetry for OpenAI chat completions executed inside the function.
+    energy telemetry for supported OpenAI and Anthropic SDK calls executed inside
+    the function.
 
     Args:
         max_delay_hours (int): Maximum time to wait for a greener grid window.
@@ -98,7 +101,6 @@ def carbon_aware(
     execution_runner = ExecutionRunner(
         _default_telemetry_runtime,
         resolved_telemetry_sink,
-        llm_provider="openai",
     )
 
     def _log_intercept(func):

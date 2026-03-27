@@ -34,6 +34,7 @@ def _disabled_carbon_budget_policy() -> CarbonBudgetPolicy:
 class _SessionState:
     energy_kwh: float = 0.0
     actual_gco2eq_so_far: float = 0.0
+    llm_providers: set[str] = field(default_factory=set)
     carbon_budget_policy: CarbonBudgetPolicy = field(default_factory=_disabled_carbon_budget_policy)
     carbon_budget_exceeded: bool = False
     model_downgrade_policy: ModelDowngradePolicy = field(
@@ -52,6 +53,9 @@ class _RuntimeSessionHooks:
 
     def record_energy_kwh(self, energy_kwh: float) -> None:
         self._runtime._record_energy(energy_kwh)
+
+    def record_llm_provider(self, provider_name: str) -> None:
+        self._runtime._record_llm_provider(provider_name)
 
     def record_model_usage(self, requested_model: str | None, effective_model: str | None) -> None:
         self._runtime._record_model_usage(requested_model, effective_model)
@@ -115,6 +119,14 @@ class EcoTelemetrySession:
         if self._state is None:
             return False
         return bool(self._state.carbon_budget_exceeded)
+
+    @property
+    def llm_provider(self) -> str | None:
+        if self._state is None or not self._state.llm_providers:
+            return None
+        if len(self._state.llm_providers) != 1:
+            return None
+        return next(iter(self._state.llm_providers))
 
     @property
     def model_usage(self) -> tuple[ModelUsageSummary, ...]:
@@ -209,6 +221,8 @@ class EcoLogitsRuntime:
         provider_names = []
 
         for adapter in self._adapters:
+            if hasattr(adapter, "is_available") and not adapter.is_available():
+                continue
             if adapter.provider_name not in provider_names:
                 provider_names.append(adapter.provider_name)
 
@@ -289,6 +303,14 @@ class EcoLogitsRuntime:
             actual_gco2eq=state.actual_gco2eq_so_far,
             energy_kwh=state.energy_kwh,
         )
+
+    def _record_llm_provider(self, provider_name: str) -> None:
+        state = self._session_state.get()
+        if state is None:
+            return
+        if not provider_name:
+            return
+        state.llm_providers.add(str(provider_name))
 
     def _get_model_downgrade_policy(self) -> ModelDowngradePolicy:
         state = self._session_state.get()

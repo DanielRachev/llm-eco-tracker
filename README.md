@@ -6,7 +6,7 @@
 
 - **Carbon-Aware Scheduling**: Delay execution based on forecasted grid carbon intensity.
 - **Forecast Providers**: Use the live UK Carbon Intensity API or inject a CSV-backed provider for deterministic runs.
-- **Telemetry Adapters**: Current telemetry support is wired for OpenAI through EcoLogits, with an adapter structure ready for more providers.
+- **Telemetry Adapters**: Current telemetry support is wired for both OpenAI chat completions and Anthropic messages through EcoLogits.
 
 ## Installation
 Within your virtual environment run:
@@ -71,14 +71,15 @@ def call_llm_with_csv_forecast(prompt):
 ```
 
 `auto_downgrade=True` enables an execution-time fallback when the chosen grid window is
-still above `dirty_threshold`. The current OpenAI defaults are:
+still above `dirty_threshold`. The built-in default fallbacks currently cover OpenAI:
 
 - `gpt-4o -> gpt-4o-mini`
 - `gpt-4.1 -> gpt-4.1-mini`
 - `gpt-4-turbo -> gpt-4o-mini`
 - `gpt-4 -> gpt-4o-mini`
 
-You can override or extend that map per decorator call:
+You can override or extend that map per decorator call. This is also how you provide
+Anthropic fallbacks:
 
 ```python
 @carbon_aware(
@@ -113,7 +114,12 @@ except CarbonBudgetExceededError as exc:
 By default, `@carbon_aware` writes normalized telemetry records to `eco_telemetry.jsonl`
 in the current working directory.
 
-The library currently supports these telemetry sink shapes:
+The library currently captures telemetry from these SDK paths:
+
+- OpenAI `client.chat.completions.create(...)`
+- Anthropic `client.messages.create(...)`
+
+The telemetry sinks themselves are:
 
 - `JsonlTelemetrySink`: writes one serialized telemetry payload per line.
 - `LoggerTelemetrySink`: emits `Telemetry record: {...}` through Python logging.

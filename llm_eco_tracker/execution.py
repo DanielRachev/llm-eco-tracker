@@ -53,6 +53,7 @@ class ExecutionRunner:
         logger.info("Greener window reached. Proceeding with execution.")
 
         total_kwh = 0.0
+        llm_provider = self._llm_provider
         model_usage: tuple[ModelUsageSummary, ...] = ()
         session_metadata: dict[str, Any] = {}
         try:
@@ -64,6 +65,7 @@ class ExecutionRunner:
                     result = await func(*args, **kwargs)
                 finally:
                     total_kwh = telemetry_session.energy_kwh
+                    llm_provider = telemetry_session.llm_provider or self._llm_provider
                     model_usage = telemetry_session.model_usage
                     session_metadata = telemetry_session.session_metadata
         finally:
@@ -71,6 +73,7 @@ class ExecutionRunner:
                 total_kwh,
                 schedule_plan,
                 forecast_provider=forecast_provider,
+                llm_provider=llm_provider,
                 model=self._resolve_legacy_model(model, model_usage),
                 model_usage=model_usage,
                 metadata=self._merge_metadata(metadata, session_metadata),
@@ -96,6 +99,7 @@ class ExecutionRunner:
 
         def run_later():
             total_kwh = 0.0
+            llm_provider = self._llm_provider
             model_usage: tuple[ModelUsageSummary, ...] = ()
             session_metadata: dict[str, Any] = {}
             try:
@@ -108,6 +112,7 @@ class ExecutionRunner:
                         outcome["result"] = func(*args, **kwargs)
                     finally:
                         total_kwh = telemetry_session.energy_kwh
+                        llm_provider = telemetry_session.llm_provider or self._llm_provider
                         model_usage = telemetry_session.model_usage
                         session_metadata = telemetry_session.session_metadata
             except BaseException as exc:
@@ -117,6 +122,7 @@ class ExecutionRunner:
                     total_kwh,
                     schedule_plan,
                     forecast_provider=forecast_provider,
+                    llm_provider=llm_provider,
                     model=self._resolve_legacy_model(model, model_usage),
                     model_usage=model_usage,
                     metadata=self._merge_metadata(metadata, session_metadata),
@@ -168,6 +174,7 @@ class ExecutionRunner:
         schedule_plan: SchedulePlan,
         *,
         forecast_provider: str | None = None,
+        llm_provider: str | None = None,
         model: str | None = None,
         model_usage: tuple[ModelUsageSummary, ...] = (),
         metadata: dict[str, Any] | None = None,
@@ -190,7 +197,7 @@ class ExecutionRunner:
                 emissions=emission_summary,
                 schedule_plan=schedule_plan,
                 forecast_provider=forecast_provider,
-                llm_provider=self._llm_provider,
+                llm_provider=llm_provider or self._llm_provider,
                 model=model,
                 model_usage=model_usage,
                 metadata=dict(metadata or {}),
