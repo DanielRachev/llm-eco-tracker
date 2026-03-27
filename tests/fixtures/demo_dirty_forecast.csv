@@ -1,0 +1,4 @@
+from,to,intensity_forecast,intensity_actual,index
+2026-03-18T08:00Z,2026-03-18T09:00Z,420,430,very high
+2026-03-18T09:00Z,2026-03-18T10:00Z,320,325,high
+2026-03-18T10:00Z,2026-03-18T11:00Z,330,335,high

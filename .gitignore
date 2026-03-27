@@ -217,6 +217,7 @@ __marimo__/
 
 # Local library telemetry output
 eco_telemetry.jsonl
+*_demo_telemetry.jsonl
 
 # Experiment results
 scenario_results.csv

@@ -1,59 +1,98 @@
 # llm-eco-tracker
 
-`llm-eco-tracker` is a lightweight Python library designed to make LLM usage more sustainable. It provides a carbon-aware decorator that can delay non-urgent work until a greener grid window and record telemetry for supported LLM calls.
+`llm-eco-tracker` is a Python library for carbon-aware LLM execution. It wraps your application code with a `@carbon_aware` decorator, delays non-urgent work into greener grid windows, captures session energy through EcoLogits, and writes telemetry you can analyze later.
+
+It is designed for normal application code, scheduled batch jobs, and agentic workflows built on top of OpenAI- and Anthropic-backed stacks such as LangChain.
+
+## Why It Exists
+
+Most LLM applications run immediately, even when the grid is unusually carbon-intensive. `llm-eco-tracker` gives you a lightweight software layer that can:
+
+- delay flexible work until a cleaner grid window
+- record baseline vs actual carbon emissions
+- downgrade to smaller models on dirty grids
+- stop a run when a per-session carbon budget is exceeded
+- plug into existing OpenAI and Anthropic SDK usage without infrastructure changes
 
 ## Features
 
-- **Carbon-Aware Scheduling**: Delay execution based on forecasted grid carbon intensity.
-- **Forecast Providers**: Use the live UK Carbon Intensity API, Electricity Maps, or inject a CSV-backed provider for deterministic runs.
-- **Telemetry Adapters**: Current telemetry support is wired for both OpenAI chat completions and Anthropic messages through EcoLogits.
+- Carbon-aware scheduling with configurable delay budgets
+- Forecast providers for UK Carbon Intensity, Electricity Maps, and deterministic CSV traces
+- Telemetry adapters for OpenAI chat completions and Anthropic messages
+- Per-session model usage summaries
+- Dirty-grid eco-fallbacks / model downgrades
+- Carbon circuit breaker / budget enforcement
+- JSONL, logger, composite, and no-op telemetry sinks
+- Benchmark, analysis, and figure-generation scripts for evaluation
 
 ## Installation
-Within your virtual environment run:
+
+### From Source
 
 ```bash
 pip install -r requirements.txt
+pip install -e .
 ```
 
-## Usage
+### From PyPI
 
-### Carbon-Aware Decorator
-
-Wrap your LLM calls with the `@carbon_aware` decorator to enable sustainable scheduling.
-The decorator supports both synchronous and asynchronous functions.
-
-The public decorator signature is:
-
-```python
-carbon_aware(
-    *,
-    max_delay_hours=2,
-    forecast_provider=None,
-    telemetry_sink=None,
-    auto_downgrade=False,
-    dirty_threshold=300.0,
-    model_fallbacks=None,
-    max_session_gco2eq=None,
-)
+```bash
+pip install llm-eco-tracker
 ```
 
+### Optional Extras
+
+```bash
+pip install "llm-eco-tracker[langchain]"
+pip install "llm-eco-tracker[benchmarks]"
+pip install "llm-eco-tracker[dev]"
+```
+
+## Quickstart
+
 ```python
+from openai import OpenAI
+
 from llm_eco_tracker import carbon_aware
 
-@carbon_aware(max_delay_hours=2)
-def call_llm(prompt):
-    # Your LLM logic here
-    pass
-```
-
-```python
-from llm_eco_tracker import carbon_aware
+client = OpenAI()
 
 @carbon_aware(max_delay_hours=2)
-async def call_llm_async(prompt):
-    # Your async LLM logic here
-    pass
+def summarize(text: str) -> str:
+    response = client.chat.completions.create(
+        model="gpt-4o-mini",
+        messages=[
+            {"role": "system", "content": "You are concise."},
+            {"role": "user", "content": text},
+        ],
+    )
+    return response.choices[0].message.content
 ```
+
+By default, telemetry is written to `./eco_telemetry.jsonl`.
+
+## Provider Support
+
+### Forecast Providers
+
+- `UKCarbonIntensityProvider`
+- `ElectricityMapsProvider`
+- `CsvForecastProvider`
+
+### Telemetry Adapters
+
+- OpenAI `client.chat.completions.create(...)`
+- Anthropic `client.messages.create(...)`
+
+## LangChain / Agentic Workflows
+
+`llm-eco-tracker` works with LangChain-style workflows when the workflow itself is orchestrated by LangChain and the actual model calls inside that workflow go through supported SDKs such as OpenAI or Anthropic. That is the safest integration pattern today, and it works well for agent loops, planners, critics, and multi-step chains.
+
+The repository includes a runnable mocked demo at [langchain_agentic_demo.py](scripts/langchain_agentic_demo.py). It uses LangChain runnables to orchestrate a multi-step workflow while the underlying OpenAI SDK calls are intercepted by `@carbon_aware`.
+
+## Forecast Provider Examples
+
+### Deterministic CSV Trace
 
 ```python
 from llm_eco_tracker import carbon_aware
@@ -62,13 +101,12 @@ from llm_eco_tracker.providers import CsvForecastProvider
 @carbon_aware(
     max_delay_hours=2,
     forecast_provider=CsvForecastProvider("tests/fixtures/mock_forecast.csv"),
-    auto_downgrade=True,
-    max_session_gco2eq=50.0,
 )
-def call_llm_with_csv_forecast(prompt):
-    # Your LLM logic here
-    pass
+def run_batch_job():
+    ...
 ```
+
+### Electricity Maps
 
 ```python
 import os
@@ -85,171 +123,101 @@ electricity_maps = ElectricityMapsProvider(
     max_delay_hours=2,
     forecast_provider=electricity_maps,
 )
-def call_llm_with_electricity_maps(prompt):
-    pass
+def run_with_electricity_maps():
+    ...
 ```
 
-`auto_downgrade=True` enables an execution-time fallback when the chosen grid window is
-still above `dirty_threshold`. The built-in default fallbacks currently cover OpenAI:
+## Eco-Fallbacks and Carbon Budgets
 
-- `gpt-4o -> gpt-4o-mini`
-- `gpt-4.1 -> gpt-4.1-mini`
-- `gpt-4-turbo -> gpt-4o-mini`
-- `gpt-4 -> gpt-4o-mini`
-
-You can override or extend that map per decorator call. This is also how you provide
-Anthropic fallbacks:
+### Dirty-Grid Model Downgrade
 
 ```python
+from llm_eco_tracker import carbon_aware
+
 @carbon_aware(
     max_delay_hours=2,
     auto_downgrade=True,
     dirty_threshold=300.0,
-    model_fallbacks={"custom-large-model": "custom-small-model"},
-    max_session_gco2eq=50.0,
+    model_fallbacks={"gpt-4.1": "gpt-4.1-mini"},
 )
-def call_llm_with_fallbacks(prompt):
-    pass
+def run_with_fallback():
+    ...
 ```
 
-`max_session_gco2eq` enables a hard per-session carbon budget. When one decorated run
-exceeds that emitted-carbon limit, the library raises `CarbonBudgetExceededError`.
+### Circuit Breaker
 
 ```python
 from llm_eco_tracker import CarbonBudgetExceededError, carbon_aware
 
-@carbon_aware(max_session_gco2eq=50.0)
-def run_agent():
-    pass
+@carbon_aware(max_session_gco2eq=5.0)
+def run_budgeted_workflow():
+    ...
 
 try:
-    run_agent()
+    run_budgeted_workflow()
 except CarbonBudgetExceededError as exc:
     print(exc.actual_gco2eq, exc.max_session_gco2eq)
 ```
 
-### Telemetry Outputs
+## Telemetry
 
-By default, `@carbon_aware` writes normalized telemetry records to `eco_telemetry.jsonl`
-in the current working directory.
+By default, each decorated run emits a normalized telemetry record containing:
 
-The library currently captures telemetry from these SDK paths:
+- timestamp
+- captured energy in `kWh`
+- baseline and actual emissions in `gCO2eq`
+- saved carbon
+- selected schedule plan
+- forecast provider
+- LLM provider
+- effective model
+- per-session model usage summary
 
-- OpenAI `client.chat.completions.create(...)`
-- Anthropic `client.messages.create(...)`
+The built-in telemetry sinks are:
 
-The telemetry sinks themselves are:
+- `JsonlTelemetrySink`
+- `LoggerTelemetrySink`
+- `CompositeTelemetrySink`
+- `NoOpTelemetrySink`
 
-- `JsonlTelemetrySink`: writes one serialized telemetry payload per line.
-- `LoggerTelemetrySink`: emits `Telemetry record: {...}` through Python logging.
-- `NoOpTelemetrySink`: discards telemetry records.
-- `CompositeTelemetrySink`: fans out one telemetry record to multiple sinks.
+## CLI
 
-Telemetry records include per-session `model_usage` summaries so you can see which
-requested models were kept versus downgraded. When the carbon circuit breaker is enabled,
-telemetry metadata also records the configured session budget, the emitted carbon reached
-so far, and whether the run was terminated for exceeding that budget.
-
-### Telemetry Report CLI
-
-You can summarize lifetime telemetry directly from the package with:
+The package ships a telemetry report CLI:
 
 ```bash
+ecotracker-report
 python -m llm_eco_tracker.report
 ```
 
-You can also point it at one or more custom inputs:
+You can also point it at custom telemetry inputs:
 
 ```bash
-python -m llm_eco_tracker.report path/to/eco_telemetry.jsonl
-python -m llm_eco_tracker.report telemetry-a.jsonl telemetry-b.jsonl
+ecotracker-report path/to/eco_telemetry.jsonl
 python -m llm_eco_tracker.report app.log --format logger
 ```
 
-The report command auto-detects JSONL versus logger-backed inputs by default and prints:
+## Demo Scripts
 
-- Total LLM jobs run
-- Total gCO2eq emitted
-- Total gCO2eq saved by EcoTracker
-- A car-travel equivalence based on emitted gCO2eq
+These scripts are designed to be screenshot-friendly and work without paid API traffic.
 
-### Trace Data
+- [langchain_agentic_demo.py](scripts/langchain_agentic_demo.py)
+  Runs a mocked LangChain workflow that makes multiple OpenAI calls inside one decorated function.
+- [eco_fallback_demo.py](scripts/eco_fallback_demo.py)
+  Demonstrates dirty-grid model downgrading with a deterministic CSV forecast.
+- [circuit_breaker_demo.py](scripts/circuit_breaker_demo.py)
+  Demonstrates the carbon budget / circuit breaker aborting a session.
 
-The repository keeps two CSV datasets:
-
-- `tests/fixtures/mock_forecast.csv`
-  A small deterministic fixture used by tests and the integration benchmark.
-- `tests/fixtures/benchmark_trace.csv`
-  A multi-day historical trace for the scheduler benchmark and paper figures.
-
-To refresh the benchmark trace from the UK Carbon Intensity API, run:
+Run them from the repository root:
 
 ```bash
-python scripts/download_mock_data.py
+python scripts/langchain_agentic_demo.py
+python scripts/eco_fallback_demo.py
+python scripts/circuit_breaker_demo.py
 ```
 
-The downloader defaults to a fixed 30-day historical window for reproducibility,
-but you can override it:
+## Evaluation Pipeline
 
-```bash
-python scripts/download_mock_data.py --start-day 2026-02-14 --end-day 2026-03-15
-python scripts/download_mock_data.py --last-n-days 30 --output-path tests/fixtures/benchmark_trace.csv
-```
-
-### Benchmark Scripts
-
-The repository now includes three evaluation scripts plus one analysis script:
-
-- `python scripts/run_benchmark.py`
-  Runs the multi-day trace-driven scheduler benchmark. For every eligible day
-  in `tests/fixtures/benchmark_trace.csv`, it sweeps all 48 submission slots and
-  evaluates three policies:
-  - `Baseline`: immediate execution scored with actual grid intensity
-  - `EcoTracker`: forecast-driven scheduling scored with actual grid intensity
-  - `Oracle`: perfect-information scheduling scored with actual grid intensity
-
-  It writes:
-  - `scenario_results.csv`
-  - `daily_summary.csv`
-  - `benchmark_summary.json`
-
-- `python scripts/analyze_benchmark_results.py`
-  Performs the paper-facing statistics on the day-level benchmark output. It
-  computes aggregate reductions, descriptive statistics, a bootstrap confidence
-  interval for the mean daily reduction, and a paired Wilcoxon signed-rank test.
-
-  It writes:
-  - `benchmark_analysis.json`
-  - `benchmark_analysis.md`
-
-- `python scripts/run_openai_integration_benchmark.py`
-  Runs an end-to-end OpenAI SDK benchmark using `AsyncOpenAI` with an
-  `httpx.MockTransport`, so the request path is real but no paid API call is
-  made. It verifies that telemetry is captured, model usage is written, energy
-  is non-zero, and the SDK monkey-patch is restored after the session.
-
-  It writes:
-  - `openai_integration_telemetry.jsonl`
-  - `openai_integration_summary.json`
-
-- `python scripts/run_overhead_benchmark.py`
-  Measures the decorator's developer-facing overhead with `max_delay_hours=0`
-  by comparing repeated batches of undecorated and decorated function calls.
-
-  It writes:
-  - `overhead_benchmark_runs.csv`
-  - `overhead_benchmark_summary.json`
-
-- `python scripts/generate_paper_figures.py`
-  Reads `scenario_results.csv`, `daily_summary.csv`, and the benchmark trace CSV
-  and renders paper-ready figures into `paper_figures/` as both PNG and PDF:
-  - `figure_1_curve`
-  - `figure_2_total_emissions`
-  - `figure_3_daily_reductions`
-
-### Recommended Evaluation Workflow
-
-Run the benchmark suite in this order:
+The repository includes a full benchmark and analysis pipeline:
 
 ```bash
 python scripts/run_benchmark.py
@@ -259,13 +227,15 @@ python scripts/run_overhead_benchmark.py
 python scripts/generate_paper_figures.py
 ```
 
-This corresponds to the intended methodology:
+Generated outputs include:
 
-- multi-day trace benchmark for scheduler effectiveness
-- day-level statistical analysis
-- end-to-end integration validation for the real OpenAI interception path
-- lightweight overhead measurement for developer experience
+- `scenario_results.csv`
+- `daily_summary.csv`
+- `benchmark_summary.json`
+- `benchmark_analysis.json`
+- `benchmark_analysis.md`
+- `paper_figures/`
 
 ## License
 
-This project is licensed under the MIT License - see the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See [LICENSE](LICENSE).

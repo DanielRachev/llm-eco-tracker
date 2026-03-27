@@ -1,8 +1,12 @@
+build
 openai
 anthropic
 ecologits
 httpx
+langchain
+langchain-openai
 matplotlib
 scipy
 python-dotenv
 requests
+twine
