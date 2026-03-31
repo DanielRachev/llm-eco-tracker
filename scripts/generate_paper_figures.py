@@ -35,6 +35,7 @@ COLOR_ECOTRACKER = "#009E73"
 COLOR_ORACLE = "#0072B2"
 COLOR_FILL = "#56B4E9"
 COLOR_GRIDLINES = "#D9D9D9"
+CAPTION_BBOX = {"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"}
 
 
 @dataclass(frozen=True, slots=True)
@@ -111,8 +112,6 @@ def configure_matplotlib() -> None:
         {
             "font.family": "DejaVu Serif",
             "font.size": 11,
-            "axes.titlesize": 14,
-            "axes.titleweight": "bold",
             "axes.labelsize": 12,
             "axes.grid": True,
             "grid.color": COLOR_GRIDLINES,
@@ -171,6 +170,32 @@ def load_scenario_rows(path: Path) -> list[ScenarioRow]:
     if not rows:
         raise SystemExit(f"No scenario rows were found in '{path}'.")
     return rows
+
+
+def create_figure(*, figsize: tuple[float, float], bottom_margin: float = 0.2):
+    fig, ax = plt.subplots(figsize=figsize)
+    fig.subplots_adjust(bottom=bottom_margin)
+    return fig, ax
+
+
+def add_figure_caption(
+    fig,
+    text: str,
+    *,
+    x: float = 0.985,
+    y: float = 0.035,
+    ha: str = "right",
+) -> None:
+    fig.text(
+        x,
+        y,
+        text,
+        transform=fig.transFigure,
+        ha=ha,
+        va="bottom",
+        fontsize=10,
+        bbox=CAPTION_BBOX,
+    )
 
 
 def load_daily_rows(path: Path) -> list[DailyRow]:
@@ -314,7 +339,7 @@ def plot_representative_day_curve(
     )
     day_summary = next(row for row in daily_rows if row.day == curve_day)
 
-    fig, ax = plt.subplots(figsize=(10.8, 5.8), constrained_layout=True)
+    fig, ax = create_figure(figsize=(10.8, 6.4), bottom_margin=0.2)
     ax.plot(
         [point.starts_at for point in window_points],
         [point.actual_intensity for point in window_points],
@@ -349,7 +374,6 @@ def plot_representative_day_curve(
     )
 
     apply_time_axis(ax, window_start=window_start, window_end=window_end)
-    ax.set_title("Figure 1. Representative-Day Grid Intensity and Temporal Shifting")
     ax.set_xlabel("Execution time")
     ax.set_ylabel("Carbon intensity (gCO2eq/kWh)")
     ax.legend(loc="upper left")
@@ -359,16 +383,7 @@ def plot_representative_day_curve(
         f"Daily reduction: {day_summary.ecotracker_saved_pct:.2f}%\n"
         f"Mean delay: {day_summary.mean_ecotracker_delay_h:.2f} h"
     )
-    ax.text(
-        0.99,
-        0.03,
-        summary_text,
-        transform=ax.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=10,
-        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"},
-    )
+    add_figure_caption(fig, summary_text)
 
     return save_figure(fig, output_dir, "figure_1_curve", formats, dpi)
 
@@ -390,7 +405,7 @@ def plot_total_emissions_bar(
         ((baseline_total - oracle_total) / baseline_total) * 100.0 if baseline_total > 0 else 0.0
     )
 
-    fig, ax = plt.subplots(figsize=(8.2, 5.8), constrained_layout=True)
+    fig, ax = create_figure(figsize=(8.2, 6.4), bottom_margin=0.2)
     labels = ["Baseline", "EcoTracker", "Oracle"]
     values = [baseline_total, ecotracker_total, oracle_total]
     colors = [COLOR_BASELINE, COLOR_ECOTRACKER, COLOR_ORACLE]
@@ -406,21 +421,14 @@ def plot_total_emissions_bar(
             fontsize=11,
         )
 
-    ax.set_title("Figure 2. Aggregate Emissions Across the Multi-Day Benchmark")
     ax.set_ylabel("Total emitted carbon (gCO2eq)")
     ax.set_axisbelow(True)
-    ax.text(
-        0.98,
-        0.95,
+    add_figure_caption(
+        fig,
         (
             f"EcoTracker reduction: {ecotracker_reduction_pct:.2f}%\n"
             f"Oracle reduction: {oracle_reduction_pct:.2f}%"
         ),
-        transform=ax.transAxes,
-        ha="right",
-        va="top",
-        fontsize=10,
-        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"},
     )
 
     return save_figure(fig, output_dir, "figure_2_total_emissions", formats, dpi)
@@ -436,7 +444,7 @@ def plot_daily_reduction_distribution(
     ecotracker_reductions = [row.ecotracker_saved_pct for row in daily_rows]
     oracle_reductions = [row.oracle_saved_pct for row in daily_rows]
 
-    fig, ax = plt.subplots(figsize=(8.6, 5.8), constrained_layout=True)
+    fig, ax = create_figure(figsize=(8.6, 6.4), bottom_margin=0.2)
     boxplot = ax.boxplot(
         [ecotracker_reductions, oracle_reductions],
         tick_labels=["EcoTracker", "Oracle"],
@@ -473,22 +481,15 @@ def plot_daily_reduction_distribution(
             zorder=4,
         )
 
-    ax.set_title("Figure 3. Distribution of Daily Emissions Reductions")
     ax.set_ylabel("Daily reduction relative to baseline (%)")
     ax.set_axisbelow(True)
-    ax.text(
-        0.98,
-        0.03,
+    add_figure_caption(
+        fig,
         (
             f"EcoTracker mean: {statistics.mean(ecotracker_reductions):.2f}%\n"
             f"EcoTracker median: {statistics.median(ecotracker_reductions):.2f}%\n"
             f"Days: {len(daily_rows)}"
         ),
-        transform=ax.transAxes,
-        ha="right",
-        va="bottom",
-        fontsize=10,
-        bbox={"facecolor": "white", "edgecolor": "#CCCCCC", "boxstyle": "round,pad=0.35"},
     )
 
     return save_figure(fig, output_dir, "figure_3_daily_reductions", formats, dpi)
